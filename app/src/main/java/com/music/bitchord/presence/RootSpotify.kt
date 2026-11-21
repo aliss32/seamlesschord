@@ -4,8 +4,11 @@ import com.music.bitchord.data.canvas.SpotifyToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import android.util.Xml
 import org.json.JSONArray
 import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import java.io.StringReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -29,9 +32,9 @@ internal object RootSpotify {
 
     const val PACKAGE = "com.spotify.music"
 
-    private const val LOG_LINES = 150
+    private const val LOG_LINES = 400
     private const val DURATION_TOLERANCE_SEC = 8
-    private const val MAX_WAIT_MS = 30_000L
+    private const val MAX_WAIT_MS = 8_000L
     private const val MAX_RATE_LIMIT_TRIES = 3
 
     private val lines = ArrayDeque<String>()
@@ -48,6 +51,43 @@ internal object RootSpotify {
     }
 
     fun recentLog(): String = synchronized(logLock) { lines.joinToString("\n") }
+
+
+    /** Set once at start-up; needed for the screen state and the small bits of memory kept between runs. */
+    @Volatile
+    var appContext: android.content.Context? = null
+
+    /** Each start-up attempt holds a ticket; a newer attempt (or a stop) makes the older ones give up at their next step. */
+    private val tickets = java.util.concurrent.atomic.AtomicInteger(0)
+
+    fun newTicket(): Int = tickets.incrementAndGet()
+
+    fun cancelAttempts() {
+        tickets.incrementAndGet()
+    }
+
+    private fun stale(ticket: Int) = tickets.get() != ticket
+
+    fun screenOn(): Boolean {
+        val pm = appContext?.getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager
+        return pm?.isInteractive ?: true
+    }
+
+    private fun prefs() = appContext?.getSharedPreferences("seamless_presence", android.content.Context.MODE_PRIVATE)
+
+    /** Whether Spotify may be shown on the real screen for a moment when the hidden screen is not available. Off by default. */
+    var allowFlash: Boolean
+        get() = prefs()?.getBoolean("allow_flash", false) ?: false
+        set(value) { prefs()?.edit()?.putBoolean("allow_flash", value)?.apply() }
+
+    /** True from the moment Spotify is muted until its sound is put back: survives the app being killed. */
+    var dirty: Boolean
+        get() = prefs()?.getBoolean("dirty", false) ?: false
+        set(value) { prefs()?.edit()?.putBoolean("dirty", value)?.apply() }
+
+    private var lastGoodRung: String
+        get() = prefs()?.getString("good_rung", "").orEmpty()
+        set(value) { prefs()?.edit()?.putString("good_rung", value)?.apply() }
 
     class Shell(val code: Int, val out: String)
 
@@ -87,22 +127,7 @@ internal object RootSpotify {
     /** Single-quotes [text] for the shell, whatever it contains. */
     private fun quoted(text: String): String = "'" + text.replace("'", "'\\''") + "'"
 
-    /** Opens that one track and plays it. */
-    fun play(trackId: String, displayId: Int?): String? =
-        launch("-a android.intent.action.VIEW -d spotify:track:$trackId:play", displayId, "track $trackId")
-
-    /**
-     * For when the track's id cannot be looked up: asks the Spotify app to
-     * search for it and play the best match, the way a voice assistant would.
-     */
-    fun playFromSearch(title: String, artist: String, displayId: Int?): String? {
-        val args = "-a android.media.action.MEDIA_PLAY_FROM_SEARCH " +
-            "--es query ${quoted("$title $artist".trim())} " +
-            "--es android.intent.extra.focus vnd.android.cursor.item/audio " +
-            "--es android.intent.extra.title ${quoted(title)} " +
-            "--es android.intent.extra.artist ${quoted(artist)}"
-        return launch(args, displayId, "search")
-    }
+    // ── State shared by the steps below ─────────────────────────────────────
 
     /** Where the app's own files are: the watchdog reads the heartbeat file from here. Set once at start-up. */
     @Volatile
@@ -112,21 +137,102 @@ internal object RootSpotify {
     var ownPackage: String = "com.seamless.chord"
 
     private const val WATCHDOG_PID = "/data/local/tmp/seamless-watchdog.pid"
+    private const val BOOT_SCRIPT = "/data/adb/service.d/seamless-unmute.sh"
     private const val STATE_PLAYING = 3
     private const val POLLS = 10
     private const val POLL_MS = 1_500L
+    private const val RESTORE_SOUND =
+        "cmd appops set $PACKAGE PLAY_AUDIO default; cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default"
 
-    /** What the Spotify app's media session says it is doing (3 = playing); null when it has no session. */
-    private fun mediaState(): Int? {
-        val dump = su("dumpsys media_session", 15).out
-        var inSpotify = false
-        for (line in dump.lines()) {
-            if (line.contains("package=")) inSpotify = line.contains(PACKAGE)
-            if (inSpotify && line.contains("state=PlaybackState")) {
-                return Regex("""state=(\d+)""").find(line)?.groupValues?.get(1)?.toIntOrNull()
-            }
+    /** Labels of the green play button on a track page, in the languages the app is likely to be in. */
+    private val PLAY_LABELS = setOf("play", "oynat", "çal", "shuffle play", "karışık çal", "karisik cal", "resume", "devam")
+
+    // ── Getting the phone ready ─────────────────────────────────────────────
+
+    /**
+     * One root script that does everything Spotify needs to keep playing with
+     * the screen off and to stay silent: no notification prompt, exempt from
+     * Doze and background limits, muted at the system but allowed audio focus.
+     * It also leaves a tiny boot script behind that puts the sound back if the
+     * phone restarts mid-session (appops outlive a reboot).
+     */
+    fun prepare(): String? {
+        dirty = true
+        val script = """
+            pm grant $PACKAGE android.permission.POST_NOTIFICATIONS 2>/dev/null
+            cmd deviceidle whitelist +$PACKAGE 2>/dev/null
+            cmd deviceidle whitelist +$ownPackage 2>/dev/null
+            cmd appops set $PACKAGE RUN_IN_BACKGROUND allow
+            cmd appops set $PACKAGE RUN_ANY_IN_BACKGROUND allow
+            am set-standby-bucket $PACKAGE active 2>/dev/null
+            am set-standby-bucket $ownPackage active 2>/dev/null
+            mkdir -p /data/adb/service.d 2>/dev/null
+            cat > $BOOT_SCRIPT <<'EOS'
+            #!/system/bin/sh
+            until [ "${'$'}(getprop sys.boot_completed)" = "1" ]; do sleep 3; done
+            sleep 8
+            cmd appops set $PACKAGE PLAY_AUDIO default
+            cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default
+            EOS
+            chmod 755 $BOOT_SCRIPT 2>/dev/null
+            cmd appops set $PACKAGE PLAY_AUDIO deny
+            cmd appops set $PACKAGE TAKE_AUDIO_FOCUS allow
+            cmd appops get $PACKAGE PLAY_AUDIO
+        """.trimIndent()
+        val result = su(script, 30)
+        log("prepare: code ${result.code}; ${result.out.lines().lastOrNull().orEmpty().take(100)}")
+        if (result.code < 0) return result.out
+        if (!result.out.contains("deny", ignoreCase = true)) {
+            log("  warning: PLAY_AUDIO does not read as denied; the track may be audible")
         }
         return null
+    }
+
+    // ── Reading what Spotify is doing ───────────────────────────────────────
+
+    /** Spotify's media session: its state (3 = playing) and the "title, artist, album" line it publishes. */
+    class Snap(val state: Int?, val desc: String, val block: String)
+
+    fun snapshot(): Snap {
+        val lines = su("dumpsys media_session", 15).out.lines()
+        val start = lines.indexOfFirst { it.contains("package=$PACKAGE") }
+        if (start < 0) return Snap(null, "", "")
+        var end = lines.size
+        for (i in start + 1 until lines.size) {
+            if (lines[i].contains("package=")) { end = i; break }
+        }
+        val block = lines.subList(start, end).joinToString("\n")
+        val state = Regex("""PlaybackState\s*\{\s*state=(\d+)""").find(block)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""\bstate=(\d+)""").find(block)?.groupValues?.get(1)?.toIntOrNull()
+        val desc = Regex("""description=([^\n]*)""").find(block)?.groupValues?.get(1).orEmpty().trim()
+        return Snap(state, desc, block)
+    }
+
+    enum class Health { OK, AD, OTHER, SILENT }
+
+    /** For the check that runs while a session is up: is Spotify still playing this track? */
+    fun health(title: String): Health {
+        val snap = snapshot()
+        return when {
+            snap.state != STATE_PLAYING -> Health.SILENT
+            isAd(snap.desc) -> Health.AD
+            looseMatch(normalize(title), normalize(snap.desc)) -> Health.OK
+            else -> Health.OTHER
+        }
+    }
+
+    private fun isAd(desc: String): Boolean {
+        val d = normalize(desc)
+        return d.startsWith("advertisement") || d.startsWith("reklam") || d.startsWith("spotify spotify")
+    }
+
+    private fun looseMatch(want: String, seen: String): Boolean {
+        if (want.isBlank() || seen.isBlank()) return false
+        if (seen.contains(want)) return true
+        val words = want.split(' ').filter { it.length > 1 }
+        if (words.isEmpty()) return false
+        val have = seen.split(' ').toSet()
+        return words.count { it in have } * 10 >= words.size * 6
     }
 
     /** The screens Spotify is the resumed app on ("0" is the real one). */
@@ -141,70 +247,313 @@ internal object RootSpotify {
         return found
     }
 
-    /** What is worth knowing when Spotify did not play: its process state, the focus stack and its audio events. */
-    private fun diagnose(state: Int?, displays: Set<String>) {
-        log("  media session state: ${state ?: "no session"}; resumed on display: ${displays.ifEmpty { setOf("none") }.joinToString()}")
-        val uid = Regex("""uid:(\d+)""").find(su("pm list packages -U $PACKAGE").out)?.groupValues?.get(1)
+    private var spotifyUid: String? = null
+
+    private fun uidOfSpotify(): String? {
+        spotifyUid?.let { return it }
+        val found = Regex("""uid:(\d+)""").find(su("pm list packages -U $PACKAGE").out)?.groupValues?.get(1)
+        spotifyUid = found
+        return found
+    }
+
+    /** Whether the system really is keeping Spotify's player silent: the line is logged for whoever reads the log. */
+    private fun logMuteState() {
+        val uid = uidOfSpotify() ?: return
+        val line = su("dumpsys audio", 15).out.lines().lastOrNull { it.contains("u/pid:$uid/") } ?: run {
+            log("  audio: no player of Spotify's is listed")
+            return
+        }
+        log("  audio player: ${line.trim().take(200)}")
+    }
+
+    /** What is worth knowing when Spotify did not play. */
+    private fun diagnose() {
+        val snap = snapshot()
+        log("  media session: state ${snap.state ?: "none"}, \"${snap.desc.take(80)}\"; resumed on display ${spotifyDisplays().ifEmpty { setOf("none") }.joinToString()}")
+        val uid = uidOfSpotify()
         if (uid != null) {
             log("  uid $uid state: " + su("cmd activity get-uid-state $uid || am get-uid-state $uid", 8).out.lines().lastOrNull().orEmpty().take(100))
         }
         val audio = su("dumpsys audio", 15).out.lines()
         val focus = audio.indexOfFirst { it.contains("Audio Focus stack", ignoreCase = true) }
         if (focus >= 0) audio.drop(focus).take(3).forEach { log("  ${it.trim().take(140)}") }
-        // The newest lines last: the old ones are not what this attempt did.
-        audio.filter { it.contains("spotify", ignoreCase = true) || it.contains("AudioHardening") }
-            .takeLast(6).forEach { log("  ${it.trim().take(160)}") }
+    }
+
+    // ── Starting a track: a ladder of ways, each one checked ────────────────
+
+    private enum class Rung(val label: String) { ID("id"), PAGE("page"), SEARCH("search"), VOICE("voice") }
+
+    private enum class Verdict { PLAYING, AD, WRONG, SILENT, CANCELLED }
+
+    private class Outcome(val verdict: Verdict, val detail: String = "")
+
+    private fun amStart(args: String, displayId: Int?): Shell {
+        val display = if (displayId != null) "--display $displayId " else ""
+        return su("am start $display$args -p $PACKAGE --activity-no-animation", 30)
     }
 
     /**
-     * Muted, started on the hidden screen when there is one, then checked:
-     * the Spotify app has to report that it really is playing. Returns null on
-     * success, or what went wrong.
+     * Waits for the Spotify app to report that it really is playing *this*
+     * track. "Playing" with some other title is not a success, and neither is
+     * a player that merely says it started.
      */
-    private fun launch(intentArgs: String, displayId: Int?, what: String): String? = synchronized(shellLock) {
-        val display = if (displayId != null) "--display $displayId " else ""
-        // Muted at the system, but allowed to take audio focus: a Spotify that is refused focus does not play at all.
-        val script = """
-            cmd appops set $PACKAGE PLAY_AUDIO deny
-            cmd appops set $PACKAGE TAKE_AUDIO_FOCUS allow
-            am start $display$intentArgs -p $PACKAGE --activity-no-animation
-            cmd appops get $PACKAGE PLAY_AUDIO
-        """.trimIndent()
-        val result = su(script, timeoutSec = 30)
-        log("play ($what, display ${displayId ?: "real"}): code ${result.code}")
-        result.out.lines().filter { it.isNotBlank() }.takeLast(6).forEach { log("  $it") }
-        if (result.code < 0) return result.out
-        if (result.out.contains("Error", ignoreCase = true) && result.out.contains("not started", ignoreCase = true)) {
-            return "the Spotify app did not accept the request"
-        }
-        if (!result.out.contains("deny", ignoreCase = true)) {
-            log("  warning: PLAY_AUDIO does not read as denied; the track may be audible")
-        }
-        var state: Int? = null
-        var displays = emptySet<String>()
+    private fun confirm(title: String, ticket: Int, displayId: Int?): Outcome {
+        val want = normalize(title)
+        var wrongRun = 0
+        var last: Snap? = null
         for (poll in 1..POLLS) {
             Thread.sleep(POLL_MS)
-            displays = spotifyDisplays()
+            if (stale(ticket)) return Outcome(Verdict.CANCELLED)
             // Asked for the hidden screen but it came up on the real one: out of the way at once.
-            if (displayId != null && "0" in displays) {
+            if (displayId != null && poll <= 3 && "0" in spotifyDisplays()) {
                 log("  spotify is on the real screen; sending Back")
                 su("input keyevent 4")
             }
-            state = mediaState()
-            if (state == STATE_PLAYING) {
-                log("  spotify is playing (poll $poll)")
-                // On the real screen on purpose: it has to be the app in front until it plays. Now it can go.
-                if (displayId == null && "0" in displays) {
-                    Thread.sleep(800)
-                    su("input keyevent 4")
-                    log("  sent Back")
-                }
-                return null
+            val snap = snapshot()
+            last = snap
+            if (snap.state != STATE_PLAYING) { wrongRun = 0; continue }
+            if (isAd(snap.desc)) {
+                log("  spotify is playing an ad (poll $poll)")
+                return Outcome(Verdict.AD, snap.desc)
+            }
+            val seen = normalize(snap.desc)
+            if (looseMatch(want, seen)) {
+                log("  spotify is playing it: \"${snap.desc.take(70)}\" (poll $poll)")
+                return Outcome(Verdict.PLAYING, snap.desc)
+            }
+            if (seen.isNotBlank() && ++wrongRun >= 3) return Outcome(Verdict.WRONG, snap.desc)
+        }
+        return Outcome(Verdict.SILENT, "state ${last?.state ?: "no session"}")
+    }
+
+    private fun <T : Any> pollUi(displayId: Int?, ticket: Int, find: (List<UiNode>) -> T?): T? {
+        val screen = displayId ?: 0
+        for (poll in 1..UI_POLLS) {
+            Thread.sleep(POLL_MS)
+            if (stale(ticket)) return null
+            val nodes = dumpUi(screen)
+            find(nodes)?.let { return it }
+            if (poll == 3 || poll == UI_POLLS) {
+                val mine = nodes.count { it.pkg == PACKAGE }
+                log("  ui: ${nodes.size} nodes, $mine from Spotify; nothing to touch yet")
+                nodes.filter { it.pkg == PACKAGE && it.label.isNotBlank() }.map { it.label.take(36) }.distinct().take(14)
+                    .forEach { log("    · $it") }
             }
         }
-        diagnose(state, displays)
-        return "Spotify did not start playing (state ${state ?: "no session"})"
+        return null
     }
+
+    private fun touch(node: UiNode, displayId: Int?, why: String) {
+        val x = (node.left + node.right) / 2
+        val y = (node.top + node.bottom) / 2
+        val target = when {
+            node.display != 0 -> "-d ${node.display} "
+            displayId != null -> "-d $displayId "
+            else -> ""
+        }
+        val tap = su("input ${target}tap $x $y")
+        log("  touched $why \"${node.label.take(40)}\" at $x,$y (code ${tap.code})")
+    }
+
+    private fun runRung(rung: Rung, id: String?, title: String, artist: String, displayId: Int?, ticket: Int): Outcome {
+        val needsScreen = rung == Rung.PAGE || rung == Rung.SEARCH
+        if (needsScreen && displayId == null && !screenOn()) {
+            return Outcome(Verdict.SILENT, "the screen is off and there is no hidden screen to read")
+        }
+        val started = when (rung) {
+            Rung.ID -> amStart("-a android.intent.action.VIEW -d spotify:track:$id:play", displayId)
+            Rung.PAGE -> amStart("-a android.intent.action.VIEW -d spotify:track:$id", displayId)
+            Rung.SEARCH -> {
+                val query = URLEncoder.encode("$title $artist".trim(), "UTF-8").replace("+", "%20")
+                amStart("-a android.intent.action.VIEW -d ${quoted("spotify:search:$query")}", displayId)
+            }
+            Rung.VOICE -> amStart(
+                "-a android.media.action.MEDIA_PLAY_FROM_SEARCH " +
+                    "--es query ${quoted("$title $artist".trim())} " +
+                    "--es android.intent.extra.focus vnd.android.cursor.item/audio " +
+                    "--es android.intent.extra.title ${quoted(title)} " +
+                    "--es android.intent.extra.artist ${quoted(artist)}",
+                displayId,
+            )
+        }
+        log("${rung.label} (display ${displayId ?: "real"}): code ${started.code}")
+        started.out.lines().filter { it.isNotBlank() }.takeLast(3).forEach { log("  $it") }
+        if (started.code < 0) return Outcome(Verdict.SILENT, started.out)
+        if (stale(ticket)) return Outcome(Verdict.CANCELLED)
+        when (rung) {
+            Rung.PAGE -> {
+                val button = pollUi(displayId, ticket) { nodes ->
+                    nodes.filter {
+                        it.pkg == PACKAGE && it.right > it.left && it.bottom > it.top && normalize(it.label) in PLAY_LABELS
+                    }.minByOrNull { it.top }
+                } ?: return Outcome(if (stale(ticket)) Verdict.CANCELLED else Verdict.SILENT, "no play button on the track page")
+                touch(button, displayId, "play")
+            }
+            Rung.SEARCH -> {
+                val row = pollUi(displayId, ticket) { findRow(it, title, artist) }
+                    ?: return Outcome(if (stale(ticket)) Verdict.CANCELLED else Verdict.SILENT, "the track was not on the Spotify screen")
+                touch(row, displayId, "result")
+            }
+            else -> Unit
+        }
+        return confirm(title, ticket, displayId)
+    }
+
+    /**
+     * Gets Spotify to play this track, trying the ways in turn until one is
+     * confirmed: the one that worked last time first. Null on success, or what
+     * went wrong. Quits quietly as soon as a newer attempt (or a stop) exists.
+     */
+    fun startPlayback(id: String?, title: String, artist: String, displayId: Int?, ticket: Int): String? {
+        val order = mutableListOf<Rung>()
+        if (id != null) { order += Rung.ID; order += Rung.PAGE }
+        order += Rung.SEARCH
+        order += Rung.VOICE
+        val good = Rung.values().firstOrNull { it.label == lastGoodRung }
+        if (good != null && good in order) { order.remove(good); order.add(0, good) }
+        var problem = "none of the ways of starting it worked"
+        var first = true
+        for (rung in order) {
+            if (stale(ticket)) return "cancelled"
+            if (!first) forceStop()
+            first = false
+            val outcome = runRung(rung, id, title, artist, displayId, ticket)
+            when (outcome.verdict) {
+                Verdict.PLAYING, Verdict.AD -> {
+                    lastGoodRung = rung.label
+                    logMuteState()
+                    if (displayId == null) leaveSpotifyOnRealScreen()
+                    return null
+                }
+                Verdict.CANCELLED -> return "cancelled"
+                Verdict.WRONG -> {
+                    problem = "Spotify played \"${outcome.detail.take(50)}\" instead"
+                    log("  ${rung.label}: $problem")
+                }
+                Verdict.SILENT -> {
+                    problem = "Spotify did not play it (${outcome.detail.take(60)})"
+                    log("  ${rung.label}: $problem")
+                }
+            }
+        }
+        diagnose()
+        return problem
+    }
+
+    /** Spotify was only on the real screen to get going: Back, until it is no longer the app in front. */
+    private fun leaveSpotifyOnRealScreen() {
+        repeat(3) {
+            Thread.sleep(800)
+            if ("0" !in spotifyDisplays()) return
+            su("input keyevent 4")
+            log("  sent Back")
+        }
+    }
+
+    // ── Driving the Spotify app's own search, by touch ──────────────────────
+
+    private const val UI_DUMP = "/data/local/tmp/seamless-ui.xml"
+    private const val UI_POLLS = 8
+
+    private class UiNode(
+        val pkg: String,
+        val cls: String,
+        val label: String,
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+        val clickable: Boolean,
+        val display: Int,
+    )
+
+    private val boundsPattern = Regex("""\[(-?\d+),(-?\d+)]\[(-?\d+),(-?\d+)]""")
+
+    private fun parseUi(xml: String): List<UiNode> {
+        val parser = Xml.newPullParser()
+        parser.setInput(StringReader(xml))
+        val nodes = mutableListOf<UiNode>()
+        var display = 0
+        var event = parser.eventType
+        while (event != XmlPullParser.END_DOCUMENT) {
+            if (event == XmlPullParser.START_TAG) {
+                when (parser.name) {
+                    "display" -> display = parser.getAttributeValue(null, "id")?.toIntOrNull() ?: 0
+                    "node" -> {
+                        val b = boundsPattern.find(parser.getAttributeValue(null, "bounds").orEmpty())
+                            ?.groupValues?.drop(1)?.map { it.toInt() }
+                        if (b != null) {
+                            val text = parser.getAttributeValue(null, "text").orEmpty()
+                            val desc = parser.getAttributeValue(null, "content-desc").orEmpty()
+                            nodes += UiNode(
+                                pkg = parser.getAttributeValue(null, "package").orEmpty(),
+                                cls = parser.getAttributeValue(null, "class").orEmpty(),
+                                label = text.ifBlank { desc },
+                                left = b[0], top = b[1], right = b[2], bottom = b[3],
+                                clickable = parser.getAttributeValue(null, "clickable") == "true",
+                                display = display,
+                            )
+                        }
+                    }
+                }
+            }
+            event = parser.next()
+        }
+        return nodes
+    }
+
+    /** The Spotify screen as text. Newer systems take a display number; older ones only see the real screen. */
+    private fun dumpUi(displayId: Int): List<UiNode> {
+        val flag = if (displayId != 0) "--display $displayId " else ""
+        val out = su("rm -f $UI_DUMP; uiautomator dump $flag$UI_DUMP >/dev/null 2>&1; cat $UI_DUMP 2>/dev/null", 25).out
+        if (!out.contains("<hierarchy")) return emptyList()
+        return runCatching { parseUi(out) }.getOrElse {
+            log("  ui: could not read the dump (${it.javaClass.simpleName})")
+            emptyList()
+        }
+    }
+
+    /** The text on the search results that is this track's title, with its artist somewhere in the same row. */
+    private fun findRow(nodes: List<UiNode>, title: String, artist: String): UiNode? {
+        val wantTitle = normalize(title)
+        if (wantTitle.isBlank()) return null
+        val wantArtists = artistsOf(artist)
+        val mine = nodes.filter { it.pkg == PACKAGE && it.right > it.left && it.bottom > it.top }
+        var best: UiNode? = null
+        var bestScore = 0
+        for (n in mine) {
+            // The search box repeats the query; it is not a result.
+            if (n.cls.contains("EditText")) continue
+            val label = normalize(n.label)
+            val score = when {
+                label.isBlank() -> 0
+                label == wantTitle -> 3
+                label.contains(wantTitle) -> 1
+                else -> 0
+            }
+            if (score == 0) continue
+            val row = mine
+                .filter {
+                    it.clickable && it.display == n.display && it.left <= n.left && it.top <= n.top &&
+                        it.right >= n.right && it.bottom >= n.bottom
+                }
+                .minByOrNull { (it.right - it.left).toLong() * (it.bottom - it.top) } ?: n
+            val around = mine
+                .filter {
+                    it.display == n.display && it.left >= row.left && it.top >= row.top &&
+                        it.right <= row.right && it.bottom <= row.bottom
+                }
+                .joinToString(" ") { normalize(it.label) }
+            if (wantArtists.isNotEmpty() && wantArtists.none { around.contains(it) }) continue
+            if (score > bestScore) {
+                bestScore = score
+                best = n
+            }
+        }
+        return best
+    }
+
+    // ── Keeping it clean ────────────────────────────────────────────────────
 
     /**
      * A small root script that outlives this app. While the app is alive and
@@ -226,8 +575,7 @@ internal object RootSpotify {
                 now=${'$'}(date +%s)
                 if [ -z "${'$'}pid" ] || [ ${'$'}((now - last)) -gt 40 ]; then
                   am force-stop $PACKAGE
-                  cmd appops set $PACKAGE PLAY_AUDIO default
-                  cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default
+                  $RESTORE_SOUND
                   rm -f $WATCHDOG_PID
                   exit 0
                 fi
@@ -238,36 +586,51 @@ internal object RootSpotify {
         log("watchdog: code ${result.code}")
     }
 
-    /** Whether the hidden screen has been tried and found not to work on this phone (kept until the app restarts). */
-    @Volatile
-    var preferReal = false
-
-    /** Stops the Spotify app without touching its sound settings: for starting over on another screen. */
+    /** Stops the Spotify app without touching its sound settings: for starting over. */
     fun forceStop() {
-        synchronized(shellLock) { su("am force-stop $PACKAGE") }
+        su("am force-stop $PACKAGE")
     }
 
     /** Stops Spotify, puts its audio settings back and retires the watchdog. */
     fun stop() {
-        synchronized(shellLock) {
-            val result = su(
-                "[ -f $WATCHDOG_PID ] && kill \$(cat $WATCHDOG_PID) 2>/dev/null; rm -f $WATCHDOG_PID; " +
-                    "am force-stop $PACKAGE; " +
-                    "cmd appops set $PACKAGE PLAY_AUDIO default; " +
-                    "cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default",
-            )
-            log("stop: code ${result.code}")
-        }
+        cancelAttempts()
+        val result = su(
+            "[ -f $WATCHDOG_PID ] && kill \$(cat $WATCHDOG_PID) 2>/dev/null; rm -f $WATCHDOG_PID; " +
+                "am force-stop $PACKAGE; $RESTORE_SOUND",
+        )
+        if (result.code == 0) dirty = false
+        log("stop: code ${result.code}")
     }
 
-    /** Only puts the audio settings back, for the times Spotify is used by hand. */
+    /** Only puts the audio settings back, for the times Spotify is used by hand or was left muted. */
     fun restoreSound() {
-        synchronized(shellLock) {
-            val result = su(
-                "cmd appops set $PACKAGE PLAY_AUDIO default; cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default",
-            )
-            log("restore sound: code ${result.code}")
+        cancelAttempts()
+        val result = su("[ -f $WATCHDOG_PID ] && kill \$(cat $WATCHDOG_PID) 2>/dev/null; rm -f $WATCHDOG_PID; $RESTORE_SOUND")
+        if (result.code == 0) dirty = false
+        log("restore sound: code ${result.code}")
+    }
+
+    // ── A report of what this phone allows ──────────────────────────────────
+
+    /** Writes what this phone does and does not allow into the log, one line each. For the self-test button. */
+    fun selfTest(hiddenScreen: String) {
+        fun show(name: String, script: String, lines: Int = 3) {
+            val r = su(script, 20)
+            val body = r.out.lines().filter { it.isNotBlank() }.take(lines).joinToString(" | ").take(220)
+            log("test $name: ${if (r.code == 0) "" else "(code ${r.code}) "}$body")
         }
+        log("── self-test ──")
+        show("root", "id")
+        show("device", "getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.build.display.id", 4)
+        show("spotify", "dumpsys package $PACKAGE | grep -E 'versionName|targetSdk' | head -2", 2)
+        show("appops", "cmd appops get $PACKAGE PLAY_AUDIO; cmd appops get $PACKAGE TAKE_AUDIO_FOCUS", 2)
+        show("doze", "cmd deviceidle whitelist | grep -E '$PACKAGE|$ownPackage'", 2)
+        show("uiautomator --display", "uiautomator dump --display 0 /data/local/tmp/seamless-t.xml 2>&1 | head -2; rm -f /data/local/tmp/seamless-t.xml", 2)
+        show("boot script", "ls -l $BOOT_SCRIPT 2>&1")
+        log("test screen: ${if (screenOn()) "on" else "off"}; hidden screen: $hiddenScreen")
+        val snap = snapshot()
+        log("test spotify session: state ${snap.state ?: "none"}, \"${snap.desc.take(80)}\"")
+        log("── end of self-test ──")
     }
 
     // ── Finding the track on Spotify ────────────────────────────────────────

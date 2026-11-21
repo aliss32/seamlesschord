@@ -56,7 +56,7 @@ class SpotifyPresenceActivity : Activity() {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(16, 8, 16, 8)
+            setPadding(16, 8, 16, 0)
             addView(button("Refresh") { refresh() })
             addView(
                 button("Copy") {
@@ -73,9 +73,30 @@ class SpotifyPresenceActivity : Activity() {
             )
             addView(button("Close") { finish() })
         }
+        val bar2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(16, 0, 16, 8)
+            addView(
+                button("Self-test") {
+                    SpotifyPresence.selfTest()
+                    log.postDelayed({ refresh() }, 6_000)
+                    log.text = "Testing what this phone allows; the report appears in a few seconds…\n\n" + log.text
+                },
+            )
+            val flash = button("") {}
+            fun flashLabel() { flash.text = if (SpotifyPresence.allowFlash) "Flash: allowed" else "Flash: never" }
+            flash.setOnClickListener {
+                SpotifyPresence.allowFlash = !SpotifyPresence.allowFlash
+                flashLabel()
+            }
+            flashLabel()
+            addView(flash)
+        }
         val scroll = ScrollView(this).apply { addView(log) }
         root.addView(status)
         root.addView(bar)
+        root.addView(bar2)
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
         refresh()

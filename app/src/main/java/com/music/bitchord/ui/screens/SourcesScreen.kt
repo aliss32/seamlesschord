@@ -133,6 +133,7 @@ fun SourcesScreen(
     val cellularQuality by AppSettings.audioQualityCellular.collectAsStateWithLifecycle()
     val metered by AppSettings.meteredConnection.collectAsStateWithLifecycle()
     val upgradeLengthSlackSeconds by AppSettings.upgradeLengthSlackSeconds.collectAsStateWithLifecycle()
+    val nextTrackBestLead by AppSettings.nextTrackBestQualityLeadSeconds.collectAsStateWithLifecycle()
     val webdavUrl by AppSettings.webdavUrl.collectAsStateWithLifecycle()
     val webdavUsername by AppSettings.webdavUsername.collectAsStateWithLifecycle()
     val webdavPassword by AppSettings.webdavPassword.collectAsStateWithLifecycle()
@@ -377,6 +378,32 @@ fun SourcesScreen(
                     AppSettings.MAX_UPGRADE_LENGTH_SLACK_SECONDS.toFloat(),
                 steps = AppSettings.MAX_UPGRADE_LENGTH_SLACK_SECONDS -
                     AppSettings.MIN_UPGRADE_LENGTH_SLACK_SECONDS - 1,
+            )
+        }
+
+        SettingsGroup(
+            header = stringResource(R.string.next_track_quality),
+            footer = stringResource(R.string.next_track_best_lead_footer),
+        ) {
+            SliderRow(
+                icon = SfIcons.Tune,
+                title = stringResource(R.string.next_track_best_lead),
+                subtitle = stringResource(R.string.next_track_best_lead_subtitle),
+                value = if (nextTrackBestLead <= 0) {
+                    stringResource(R.string.off)
+                } else {
+                    stringResource(R.string.seconds_short, nextTrackBestLead)
+                },
+                sliderValue = nextTrackBestLead.toFloat(),
+                onSliderValue = {
+                    val step = AppSettings.NEXT_TRACK_BEST_LEAD_STEP_SECONDS
+                    AppSettings.setNextTrackBestQualityLeadSeconds((it / step).roundToInt() * step)
+                },
+                valueRange = AppSettings.MIN_NEXT_TRACK_BEST_LEAD_SECONDS.toFloat()..
+                    AppSettings.MAX_NEXT_TRACK_BEST_LEAD_SECONDS.toFloat(),
+                steps = (AppSettings.MAX_NEXT_TRACK_BEST_LEAD_SECONDS -
+                    AppSettings.MIN_NEXT_TRACK_BEST_LEAD_SECONDS) /
+                    AppSettings.NEXT_TRACK_BEST_LEAD_STEP_SECONDS - 1,
             )
         }
 

@@ -63,6 +63,7 @@ import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.CastConnected
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.Headphones
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material.icons.rounded.Watch
@@ -961,6 +962,8 @@ private fun OutputPartyPill(
 ) {
     val badge = rememberPartyBadge()
     val shown by PlayerSettings.showListenTogetherButton.collectAsStateWithLifecycle()
+    val spotifyConnected by PlayerSettings.spotifyConnected.collectAsStateWithLifecycle()
+    val spotifyPresenceOn by PlayerSettings.spotifyPresenceEnabled.collectAsStateWithLifecycle()
     val output = rememberOutputGlyph()
     // Party half hidden only outside a party: once in one, this is the way to
     // who's in it. Without it the output glyph stands alone, drawn like the
@@ -1005,6 +1008,19 @@ private fun OutputPartyPill(
             highlighted = badge.inParty,
             trailingLabel = badge.members.takeIf { badge.inParty }?.toString(),
         )
+        // Spotify's activity, switched on and off from where the party is: lit
+        // while the silent web player is running for it. Only for a listener
+        // who has signed in to Spotify — there is nothing to run it on otherwise.
+        if (spotifyConnected) {
+            PillDivider()
+            PillSegment(
+                icon = Icons.Rounded.GraphicEq,
+                iconSize = PILL_PARTY_SIZE,
+                contentDescription = stringResource(Res.string.spotify_presence_toggle),
+                onClick = { PlayerSettings.setSpotifyPresenceEnabled(!spotifyPresenceOn) },
+                highlighted = spotifyPresenceOn,
+            )
+        }
     }
 }
 

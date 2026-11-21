@@ -1507,7 +1507,15 @@ class SourcesTest {
         val queries = TrackMatcher.queries(
             TrackMatcher.Target("Paniyon Sa (From \"Satyameva Jayate\") | Official Video", "Atif Aslam, Tulsi Kumar"),
         )
-        assertEquals(listOf("paniyon sa atif aslam", "paniyon sa"), queries)
+        assertEquals(
+            listOf(
+                "paniyon sa atif aslam",
+                "paniyon sa atif aslam tulsi kumar",
+                "paniyon sa tulsi kumar",
+                "paniyon sa",
+            ),
+            queries,
+        )
     }
 
     /** A version marker is part of what to search for, not packaging to drop. */

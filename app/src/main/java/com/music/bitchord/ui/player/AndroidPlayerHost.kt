@@ -83,6 +83,9 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         override val disableBlendEffects get() = AppSettings.disableBlendEffects
         override val showNerdStats get() = AppSettings.showNerdStats
         override val showListenTogetherButton get() = AppSettings.showListenTogetherButton
+        override val spotifyConnected get() = AppSettings.spotifyConnected
+        override val spotifyPresenceEnabled get() = AppSettings.spotifyPresenceEnabled
+        override fun setSpotifyPresenceEnabled(value: Boolean) = AppSettings.setSpotifyPresenceEnabled(value)
         override val smartAnalysis get() = AppSettings.smartAnalysis
         override val automixDetail get() = AppSettings.automixDetail
         override val smartFadeEnabled get() = AppSettings.smartFadeEnabled

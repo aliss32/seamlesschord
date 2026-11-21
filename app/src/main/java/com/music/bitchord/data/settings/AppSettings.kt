@@ -201,6 +201,13 @@ object AppSettings {
     val upgradeLengthSlackSeconds = MutableStateFlow(DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS)
 
     /**
+     * How many seconds before the playing track ends the next one's best copy is
+     * looked for, so it starts on that copy instead of upgrading while it plays.
+     * Zero turns it off.
+     */
+    val nextTrackBestQualityLeadSeconds = MutableStateFlow(DEFAULT_NEXT_TRACK_BEST_LEAD_SECONDS)
+
+    /**
      * What a saved file should be, answered on its own terms.
      *
      * Kept apart from the two ceilings above on purpose. Those are about what
@@ -761,6 +768,15 @@ object AppSettings {
     val listenBrainzPrimaryArtistOnly = MutableStateFlow(false)
     val spotifySpdcToken = MutableStateFlow("")
 
+    /** Whether there is a Spotify sign-in at all — what the player's own controls need to know, without the cookie. */
+    val spotifyConnected = MutableStateFlow(false)
+
+    /**
+     * Whether Spotify's web player runs silently in the background so that
+     * Spotify shows what is playing here. Off until asked for.
+     */
+    val spotifyPresenceEnabled = MutableStateFlow(false)
+
     // ── Discord Rich Presence ───────────────────────────────────────────
 
     /**
@@ -967,6 +983,10 @@ object AppSettings {
             KEY_UPGRADE_LENGTH_SLACK_SECONDS,
             DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS,
         ).coerceIn(MIN_UPGRADE_LENGTH_SLACK_SECONDS, MAX_UPGRADE_LENGTH_SLACK_SECONDS)
+        nextTrackBestQualityLeadSeconds.value = prefs.getInt(
+            KEY_NEXT_TRACK_BEST_LEAD_SECONDS,
+            DEFAULT_NEXT_TRACK_BEST_LEAD_SECONDS,
+        ).coerceIn(MIN_NEXT_TRACK_BEST_LEAD_SECONDS, MAX_NEXT_TRACK_BEST_LEAD_SECONDS)
         migrateDownloadQuality()
         downloadQuality.value = readDownloadQuality()
         wifiOnlyDownloads.value = prefs.getBoolean(KEY_WIFI_ONLY_DOWNLOADS, true)
@@ -1097,6 +1117,8 @@ object AppSettings {
         listenBrainzToken.value = prefs.getString(KEY_LISTENBRAINZ_TOKEN, "").orEmpty()
         listenBrainzPrimaryArtistOnly.value = prefs.getBoolean(KEY_LISTENBRAINZ_PRIMARY_ARTIST_ONLY, false)
         spotifySpdcToken.value = prefs.getString(KEY_SPOTIFY_SPDC_TOKEN, "").orEmpty()
+        spotifyConnected.value = spotifySpdcToken.value.isNotBlank()
+        spotifyPresenceEnabled.value = prefs.getBoolean(KEY_SPOTIFY_PRESENCE_ENABLED, false)
         replayGenres.value = prefs.getBoolean(KEY_REPLAY_GENRES, true)
         filterNonMusicAudio.value = prefs.getBoolean(KEY_FILTER_NON_MUSIC_AUDIO, true)
         localMusicSort.value = readLocalMusicSort(KEY_LOCAL_MUSIC_SORT)
@@ -1275,6 +1297,15 @@ object AppSettings {
         )
         upgradeLengthSlackSeconds.value = normalized
         prefs.edit().putInt(KEY_UPGRADE_LENGTH_SLACK_SECONDS, normalized).apply()
+    }
+
+    fun setNextTrackBestQualityLeadSeconds(value: Int) {
+        val normalized = value.coerceIn(
+            MIN_NEXT_TRACK_BEST_LEAD_SECONDS,
+            MAX_NEXT_TRACK_BEST_LEAD_SECONDS,
+        )
+        nextTrackBestQualityLeadSeconds.value = normalized
+        prefs.edit().putInt(KEY_NEXT_TRACK_BEST_LEAD_SECONDS, normalized).apply()
     }
 
     fun setDownloadQuality(value: DownloadQuality) {
@@ -1773,8 +1804,14 @@ object AppSettings {
 
     fun setSpotifySpdcToken(value: String) {
         spotifySpdcToken.value = value
+        spotifyConnected.value = value.isNotBlank()
         prefs.edit().putString(KEY_SPOTIFY_SPDC_TOKEN, value).apply()
         SpotifyToken.invalidate()
+    }
+
+    fun setSpotifyPresenceEnabled(value: Boolean) {
+        spotifyPresenceEnabled.value = value
+        prefs.edit().putBoolean(KEY_SPOTIFY_PRESENCE_ENABLED, value).apply()
     }
 
     fun setLastfmScrobbleEnabled(value: Boolean) {
@@ -2238,6 +2275,10 @@ object AppSettings {
     const val DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS = 5
     const val MIN_UPGRADE_LENGTH_SLACK_SECONDS = 0
     const val MAX_UPGRADE_LENGTH_SLACK_SECONDS = 10
+    const val DEFAULT_NEXT_TRACK_BEST_LEAD_SECONDS = 30
+    const val MIN_NEXT_TRACK_BEST_LEAD_SECONDS = 0
+    const val MAX_NEXT_TRACK_BEST_LEAD_SECONDS = 90
+    const val NEXT_TRACK_BEST_LEAD_STEP_SECONDS = 5
 
     private const val DEFAULT_PERFORMANCE_REFRESH_RATE = 120
 
@@ -2251,6 +2292,7 @@ object AppSettings {
     private const val KEY_QUALITY_WIFI = "audio_quality_wifi"
     private const val KEY_QUALITY_CELLULAR = "audio_quality_cellular"
     private const val KEY_UPGRADE_LENGTH_SLACK_SECONDS = "upgrade_length_slack_seconds"
+    private const val KEY_NEXT_TRACK_BEST_LEAD_SECONDS = "next_track_best_lead_seconds"
     private const val KEY_QUALITY_DOWNLOAD = "audio_quality_download"
     private const val KEY_WIFI_ONLY_DOWNLOADS = "wifi_only_downloads"
     private const val KEY_EXPORT_DOWNLOADS = "export_downloads"
@@ -2363,6 +2405,7 @@ object AppSettings {
     private const val KEY_LISTENBRAINZ_TOKEN = "listenbrainz_token"
     private const val KEY_LISTENBRAINZ_PRIMARY_ARTIST_ONLY = "listenbrainz_primary_artist_only"
     private const val KEY_SPOTIFY_SPDC_TOKEN = "spotify_spdc_token"
+    private const val KEY_SPOTIFY_PRESENCE_ENABLED = "spotify_presence_enabled"
 
     private const val KEY_DISCORD_USERNAME = "discord_username"
     private const val KEY_DISCORD_NAME = "discord_name"

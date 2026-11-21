@@ -83,8 +83,24 @@ object TrackMatcher {
     fun queries(target: Target): List<String> {
         val title = searchableTitle(target.title, target.artist)
         if (title.isBlank()) return emptyList()
-        val artist = primaryArtist(target.artist)
-        val out = if (artist.isBlank()) mutableListOf(title) else mutableListOf("$title $artist", title)
+        // Every credited artist is asked for, since a catalogue files a duet
+        // under whichever of the two it likes: the first on its own (what a
+        // track is most often filed under), then all of them together, then
+        // each of the others alone, and the bare title last. Later queries only
+        // run when the earlier ones found nothing, so the extra ones cost a
+        // search only where a track would otherwise have been written off.
+        val artists = creditedArtists(target.artist)
+        val out = if (artists.isEmpty()) {
+            mutableListOf(title)
+        } else {
+            mutableListOf("$title ${artists.first()}").also { list ->
+                if (artists.size > 1) {
+                    list += "$title ${artists.joinToString(" ")}"
+                    artists.drop(1).forEach { list += "$title $it" }
+                }
+                list += title
+            }
+        }
         // The other script, asked once and without the artist: a pure-katakana
         // title ("コイコガレ") never meets its romaji-filed row ("Koi Kogare")
         // when only one script is asked for, and neither index answers the
@@ -103,6 +119,18 @@ object TrackMatcher {
     /** The title with the packaging taken off, version markers kept. */
     internal fun searchableTitle(title: String, artist: String = ""): String =
         parseTitle(title, artist).let { (it.words + it.versions).joinToString(" ") }
+
+    /**
+     * Every credited artist, in credit order, at most [MAX_QUERY_ARTISTS] of
+     * them — a long feature list is searched for by its first names, not by
+     * every guest.
+     */
+    internal fun creditedArtists(artist: String): List<String> =
+        normalize(artist).split(ARTIST_SEPARATORS)
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it !in YOUTUBE_TYPE_LABELS }
+            .distinct()
+            .take(MAX_QUERY_ARTISTS)
 
     /** The first credited artist — who a catalogue is most likely to file the track under. */
     internal fun primaryArtist(artist: String): String {
@@ -818,6 +846,7 @@ object TrackMatcher {
      * evidence there is in that case, so it has to be the strong kind.
      */
     private const val CREDIT_OVERRIDE_SEC = 2
+    private const val MAX_QUERY_ARTISTS = 3
     private const val DURATION_TIGHT = 40
     private const val DURATION_LOOSE = 15
     private const val ALBUM_EXACT = 35

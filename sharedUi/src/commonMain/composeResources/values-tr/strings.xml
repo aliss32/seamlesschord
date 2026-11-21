@@ -43,6 +43,7 @@
     <string name="listen_together_jam_unnamed">Birlikte dinleme</string>
     <string name="listen_together_manage">Yönet</string>
     <string name="listen_together_open">Birlikte dinle</string>
+    <string name="spotify_presence_toggle">Spotify etkinliği</string>
     <string name="listen_together_open_count">Birlikte dinleme · %1$d</string>
     <string name="listen_together_you">Sen</string>
     <string name="mixing">Miksleniyor</string>

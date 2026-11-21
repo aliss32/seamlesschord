@@ -45,6 +45,7 @@
     <string name="listen_together_jam_unnamed">Listening together</string>
     <string name="listen_together_manage">Manage</string>
     <string name="listen_together_open">Listen together</string>
+    <string name="spotify_presence_toggle">Spotify activity</string>
     <string name="listen_together_open_count">Listening together · %1$d</string>
     <string name="listen_together_you">You</string>
     <string name="mixing">Mixing</string>

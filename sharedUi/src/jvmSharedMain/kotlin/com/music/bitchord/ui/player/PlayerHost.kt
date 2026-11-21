@@ -262,6 +262,11 @@ interface PlayerSettingsSource {
     val showNerdStats: StateFlow<Boolean>
     /** Whether the output / Listen Together pill sits under the transport. */
     val showListenTogetherButton: StateFlow<Boolean>
+    /** Whether there is a Spotify sign-in for the pill's Spotify activity control to act on. */
+    val spotifyConnected: StateFlow<Boolean>
+    /** Whether Spotify's web player is running silently so Spotify shows what is playing. */
+    val spotifyPresenceEnabled: StateFlow<Boolean>
+    fun setSpotifyPresenceEnabled(value: Boolean)
     val smartAnalysis: StateFlow<SmartAnalysis>
     /**
      * Automix's detailed stats line — both songs' analysis, then the planned

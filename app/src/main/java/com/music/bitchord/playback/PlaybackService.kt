@@ -13,6 +13,7 @@ import android.net.Uri
 import android.widget.Toast
 import android.os.Bundle
 import android.os.Handler
+import android.os.PowerManager
 import android.os.SystemClock
 import com.music.bitchord.data.TelemetryProvenance
 import kotlinx.coroutines.sync.Mutex
@@ -136,6 +137,7 @@ import com.music.bitchord.data.model.isUnresolvedSpotify
 import com.music.bitchord.data.scrobbling.LastFM
 import com.music.bitchord.data.scrobbling.ListenBrainzManager
 import com.music.bitchord.data.scrobbling.ScrobbleManager
+import com.music.bitchord.presence.SpotifyPresence
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.settings.AudioQuality
 import com.music.bitchord.data.settings.BitPerfectMode
@@ -893,6 +895,7 @@ class PlaybackService : MediaLibraryService() {
             // the last thing that happens before the process goes idle.
             if (isPlaying) prefetchAround(exoPlayer) else cancelPrefetch()
             if (isPlaying) lookForBetterCopy(exoPlayer)
+            reportToSpotifyPresence(exoPlayer, isPlaying)
             savePlaybackState(exoPlayer)
             // Not strictly needed for the glyph — onPlayWhenReadyChanged has
             // already flipped that — but this is where hasNext/hasPrevious and
@@ -1787,6 +1790,7 @@ class PlaybackService : MediaLibraryService() {
         observeSettings()
         observeScrobbling()
         observeDiscord()
+        SpotifyPresence.init(applicationContext)
         watchSleepTimer()
         val restored = if (PartyPersonalQueueStash.hasStash()) {
             val stashed = PartyPersonalQueueStash.load()
@@ -4894,7 +4898,19 @@ class PlaybackService : MediaLibraryService() {
         // reaches its bytes through the same resolving data source the real one
         // does, and that is where a marked URI is turned back into a stream.
         QualityUpgrade.force(mediaId, stream)
-        val warmedThrough = auditionUpgrade(mediaId, at, upgradedUri, stream, alreadyFilled)
+        // With a spare to hand over on, that spare is the proof: it opens the
+        // stream, checks its length and decoder, and has to hold steady before
+        // it is heard (see [handOverSeamlessly]). A separate audition player
+        // first would only repeat that work, at twice the decoding and a few
+        // seconds' delay. Without one, the audition stands as before.
+        val proveOnSpare = canHandOverSeamlessly()
+        val warmedThrough = (
+            if (proveOnSpare) {
+                warmForHandOver(upgradedUri, alreadyFilled)
+            } else {
+                auditionUpgrade(mediaId, at, upgradedUri, stream, alreadyFilled)
+            }
+            )
             // The audition takes seconds, long enough for the ceiling to drop
             // under it; treated as a failed one, so nothing is cut.
             ?.takeIf { SourceRegistry.permitsForPlayback(stream.sourceConfigId) }
@@ -4970,7 +4986,8 @@ class PlaybackService : MediaLibraryService() {
         // different route. And nothing is held back on a track nowhere near a
         // transition: the reading is then already long past the grace.
         withContext(Dispatchers.Main) { crossfade?.msSinceTransition() }?.let { since ->
-            if (since < UPGRADE_AFTER_CROSSFADE_MS) {
+            // Nothing to settle for when the hand-over is a fade rather than a cut.
+            if (since < UPGRADE_AFTER_CROSSFADE_MS && !proveOnSpare) {
                 val settle = UPGRADE_AFTER_CROSSFADE_MS - since
                 TrackLog.d("BitChord", "upgrade for $mediaId holding ${settle}ms; a transition just ended")
                 delay(settle)
@@ -5034,6 +5051,14 @@ class PlaybackService : MediaLibraryService() {
             // protect (paused, a party, no spare player). See
             // [handOverSeamlessly].
             if (handOverSeamlessly(mediaId, now, upgradedUri, stream)) return@withContext
+            if (proveOnSpare) {
+                // The moment to hand over on has passed (paused, a party) and
+                // nothing has proved this stream on a player of its own, so
+                // it is not cut in unheard. It comes back when playing again.
+                QualityUpgrade.shelve(mediaId, stream)
+                TrackLog.d("BitChord", "upgrade for $mediaId shelved: not playing at hand-over time", about = mediaId)
+                return@withContext
+            }
 
             // Read before the swap overwrites it — see [watchUpgrade]'s
             // NerdStats cleanup for why the pre-upgrade claim has to be
@@ -5178,6 +5203,10 @@ class PlaybackService : MediaLibraryService() {
                 val items = (0 until activePlayer.mediaItemCount).map { i ->
                     if (i == currentIndex) upgradedItem else activePlayer.getMediaItemAt(i)
                 }
+                // The spare opens the upgraded stream while the old one is still
+                // what is heard, so the stats must not announce it yet — the same
+                // reason an audition says so. Recorded explicitly once adopted.
+                QualityUpgrade.beginAudition(mediaId)
                 standby.stop()
                 standby.clearMediaItems()
                 standby.skipSilenceEnabled = activePlayer.skipSilenceEnabled
@@ -5225,7 +5254,12 @@ class PlaybackService : MediaLibraryService() {
                         return@launch
                     }
                     val t = SystemClock.elapsedRealtime()
-                    if (standby.isPlaying && standby.playbackState == Player.STATE_READY) {
+                    // Steady means playing, ready, and with enough already in
+                    // hand that it will not run dry during the fade — the
+                    // lead the audition used to establish beforehand.
+                    val ahead = standby.bufferedPosition - standby.currentPosition
+                    val stocked = ahead >= UPGRADE_HANDOVER_MIN_LEAD_MS || standby.bufferedPercentage >= 100
+                    if (standby.isPlaying && standby.playbackState == Player.STATE_READY && stocked) {
                         if (t - steadySince >= UPGRADE_HANDOVER_HOLD_MS) break
                     } else {
                         steadySince = t
@@ -5238,18 +5272,45 @@ class PlaybackService : MediaLibraryService() {
                     delay(20)
                 }
 
-                // 3. Line the two up on the listener's position, as it is now.
-                val drift = standby.currentPosition - activePlayer.currentPosition
-                if (abs(drift) > UPGRADE_HANDOVER_MAX_DRIFT_MS) {
-                    standby.seekTo(currentIndex, activePlayer.currentPosition)
-                    val resyncBy = SystemClock.elapsedRealtime() + UPGRADE_HANDOVER_RESYNC_MS
+                // The decoder has to be handed what the source promised — the
+                // one thing a catalogue's claim cannot vouch for.
+                val decoded = standby.audioFormat?.sampleMimeType
+                if (decoded != null && stream.format.isLossless == true && !NerdStats.isLosslessMime(decoded)) {
+                    TrackLog.w("BitChord", "upgrade for $mediaId promised ${stream.format.summary} but the decoder was handed $decoded; keeping the current stream", about = mediaId)
+                    drop = true
+                    return@launch
+                }
+
+                // 3. Same second. The fade is only seamless if both streams are
+                //    at the same point in the song when it starts — a gap of a
+                //    few hundred milliseconds is heard as words repeating or
+                //    being skipped. Both players' own clocks are compared, and
+                //    the spare is re-aimed a little ahead of the listener by
+                //    however long its last seek took to land.
+                var seekLead = UPGRADE_HANDOVER_FIRST_SEEK_LEAD_MS
+                var aligned = false
+                for (attempt in 0 until UPGRADE_HANDOVER_ALIGN_TRIES) {
+                    val drift = standby.currentPosition - activePlayer.currentPosition
+                    if (abs(drift) <= UPGRADE_HANDOVER_MAX_DRIFT_MS) {
+                        aligned = true
+                        break
+                    }
+                    val seekAt = SystemClock.elapsedRealtime()
+                    standby.seekTo(currentIndex, activePlayer.currentPosition + seekLead)
+                    val resyncBy = seekAt + UPGRADE_HANDOVER_RESYNC_MS
                     while (isActive && !(standby.playbackState == Player.STATE_READY && standby.isPlaying) &&
                         SystemClock.elapsedRealtime() < resyncBy
                     ) {
-                        delay(10)
+                        delay(5)
                     }
-                    if (!standby.isPlaying) {
-                        TrackLog.w("BitChord", "upgrade for $mediaId did not resume after aligning; keeping the current stream", about = mediaId)
+                    if (!standby.isPlaying) break
+                    seekLead = (SystemClock.elapsedRealtime() - seekAt).coerceIn(20L, 400L)
+                    if (!stillHere()) return@launch
+                }
+                if (!aligned) {
+                    val finalDrift = standby.currentPosition - activePlayer.currentPosition
+                    if (!standby.isPlaying || abs(finalDrift) > UPGRADE_HANDOVER_ACCEPT_DRIFT_MS) {
+                        TrackLog.w("BitChord", "upgrade for $mediaId could not be lined up (${finalDrift}ms apart); keeping the current stream", about = mediaId)
                         drop = true
                         return@launch
                     }
@@ -5317,6 +5378,7 @@ class PlaybackService : MediaLibraryService() {
                     }
                 }
             } finally {
+                QualityUpgrade.endAudition(mediaId)
                 if (!landed) {
                     // Nothing was ever cut, so there is nothing to put back —
                     // only the spare to release, unless a version switch has
@@ -5346,6 +5408,155 @@ class PlaybackService : MediaLibraryService() {
         }
         // Held here so the "Upgrading quality" badge stays up for the whole of it.
         finished.await()
+        return true
+    }
+
+    /** Tells the Spotify activity setting what is playing; a one-setting read while that is off. */
+    private fun reportToSpotifyPresence(exoPlayer: ExoPlayer, playing: Boolean) {
+        val item = exoPlayer.currentMediaItem ?: return
+        SpotifyPresence.onPlayback(
+            mediaId = item.mediaId,
+            title = item.mediaMetadata.title?.toString(),
+            artist = item.mediaMetadata.artist?.toString(),
+            durationMs = exoPlayer.duration.takeIf { it != C.TIME_UNSET } ?: 0L,
+            playing = playing,
+        )
+    }
+
+    /** Whether a hand-over has a spare to run on, a track audibly playing, and nobody else using either. */
+    private fun canHandOverSeamlessly(): Boolean {
+        val active = player ?: return false
+        return spare != null && crossfade != null && active.isPlaying &&
+            !ListenTogether.state.value.inParty && versionSwapJob?.isActive != true
+    }
+
+    /**
+     * What an audition's first step does for a stream that is about to be
+     * proved on the spare instead: a clean slot, and the opening on disk, so
+     * that the spare does not have to reach the network for the one read
+     * nothing can start without. Reports "warmed through the whole track" since
+     * the spare, not this, decides when the stream is good enough.
+     */
+    private suspend fun warmForHandOver(upgradedUri: String, renditionAlreadyFilled: Boolean): Long =
+        withContext(Dispatchers.IO) {
+            if (!renditionAlreadyFilled) AudioCache.discardRendition(Uri.parse(upgradedUri))
+            AudioCache.warmRange(Uri.parse(upgradedUri), 0, UPGRADE_HEADER_BYTES)
+            Long.MAX_VALUE
+        }
+
+    /** The track [prepareNextBest] has taken on, so each next track is looked at once. */
+    private var nextBestFor: String? = null
+    private var nextBestJob: Job? = null
+
+    /**
+     * Gives the next track its best copy before it is reached, so that it
+     * starts on it rather than starting on a quick source and being upgraded
+     * while it plays.
+     *
+     * Once the playing track is within the listener's chosen lead of its end,
+     * the next one is searched for the way a second look would — every source,
+     * waiting for the slow ones — and when something clearly better than what
+     * it would otherwise start on turns up, the queued item is swapped for one
+     * carrying that stream. It is the next item, not the playing one, so no
+     * audio is touched; its opening is put on disk first so it starts at once.
+     *
+     * Costs only what it saves: a single search per track, started inside the
+     * window and not before, run off the main thread, dropped the moment the
+     * queue moves on, and skipped on battery saver, in a party, and for
+     * anything that is not a streamed YouTube track a source could stand in
+     * for. Called from the progress sampler, so it adds no timer of its own.
+     */
+    private fun prepareNextBest(exoPlayer: ExoPlayer) {
+        val nextIndex = exoPlayer.nextMediaItemIndex
+        val nextItem = nextIndex.takeIf { it != C.INDEX_UNSET && it in 0 until exoPlayer.mediaItemCount }
+            ?.let(exoPlayer::getMediaItemAt)
+        // A search for a track that is no longer next is of no use to anyone.
+        if (nextBestJob?.isActive == true && nextBestFor != nextItem?.mediaId) nextBestJob?.cancel()
+
+        val lead = AppSettings.nextTrackBestQualityLeadSeconds.value
+        if (lead <= 0 || nextItem == null) return
+        val duration = exoPlayer.duration
+        if (duration == C.TIME_UNSET || duration <= 0) return
+        if (duration - exoPlayer.currentPosition > lead * 1_000L) return
+        val nextId = nextItem.mediaId
+        if (nextBestFor == nextId || nextId == exoPlayer.currentMediaItem?.mediaId) return
+        if (ListenTogether.state.value.inParty) return
+        if (getSystemService(PowerManager::class.java)?.isPowerSaveMode == true) return
+        if (!SourceResolver.canSubstituteForYouTube()) return
+        if (SourceRegistry.parseTrackKey(nextId) != null || isLocalPlayback(nextId, nextItem) ||
+            Downloads.saved.value.containsKey(nextId) || OriginalVersion.isPinned(nextId) ||
+            MusicOnlyPlayback.wants(nextItem)
+        ) {
+            return
+        }
+        val uri = nextItem.localConfiguration?.uri ?: return
+        // Already carries an upgrade (or a hand-made revert): nothing to add.
+        if (QualityUpgrade.cacheTag(uri) != null) return
+        val target = TrackMatcher.targetOf(nextItem.toSong())
+        if (target.title.isBlank() || target.durationSec == null || target.isVideo) return
+
+        nextBestFor = nextId
+        val serving = StreamChoice.of(nextId)
+        nextBestJob = scope.launch(TrackLog.about(nextId)) {
+            // What it would start on otherwise: the quick source already
+            // pinned for it, or YouTube's own Opus, whose ladder tops out far
+            // below anything worth the trouble.
+            val floor = serving?.format ?: StreamFormat(kbps = NEXT_BEST_FLOOR_KBPS)
+            TrackLog.d("BitChord", "looking for the best copy of the next track, '${target.title}'", about = nextId)
+            val stream = runCatching {
+                withContext(Dispatchers.IO) {
+                    SourceResolver.upgradeFor(target, playing = floor, servedBy = serving?.sourceConfigId)
+                }
+            }.onFailure { if (it is CancellationException) throw it }.getOrNull() ?: return@launch
+            if (!SourceRegistry.permitsForPlayback(stream.sourceConfigId)) return@launch
+
+            val upgradedUri = QualityUpgrade.upgradedUri(uri.toString())
+            QualityUpgrade.force(nextId, stream)
+            val warmed = runCatching {
+                withContext(Dispatchers.IO) {
+                    AudioCache.discardRendition(Uri.parse(upgradedUri))
+                    AudioCache.warmRange(Uri.parse(upgradedUri), 0, NEXT_BEST_HEAD_BYTES)
+                }
+            }.onFailure { if (it is CancellationException) throw it }.isSuccess
+            val applied = warmed && withContext(Dispatchers.Main) { applyBestToNext(nextId, stream, upgradedUri) }
+            if (!applied) {
+                QualityUpgrade.forget(nextId)
+                withContext(NonCancellable + Dispatchers.IO) { AudioCache.discardRendition(Uri.parse(upgradedUri)) }
+            }
+        }
+    }
+
+    /**
+     * Main thread. Swaps the queued next item for its upgraded copy — or says
+     * it is no longer the moment: the queue moved, a blend has armed onto the
+     * old item, or a version switch is using the spare. In every one of those
+     * the track simply starts the usual way and the ordinary second look
+     * upgrades it without a cut.
+     */
+    private fun applyBestToNext(nextId: String, stream: SourceStream, upgradedUri: String): Boolean {
+        val live = player ?: return false
+        if (crossfade?.isTransitioning() == true || versionSwapJob?.isActive == true) return false
+        val index = live.nextMediaItemIndex
+        if (index == C.INDEX_UNSET || index !in 0 until live.mediaItemCount) return false
+        val item = live.getMediaItemAt(index)
+        if (item.mediaId != nextId) return false
+        val current = item.localConfiguration?.uri ?: return false
+        if (QualityUpgrade.cacheTag(current) != null) return false
+        val upgraded = item.buildUpon()
+            .setUri(upgradedUri)
+            .setMediaMetadata(
+                item.mediaMetadata.buildUpon()
+                    .setExtras(
+                        Bundle(item.mediaMetadata.extras ?: Bundle()).apply {
+                            putBoolean(EXTRA_QUALITY_UPGRADED, true)
+                        },
+                    )
+                    .build(),
+            )
+            .withResolvedStreamType(stream.url)
+            .build()
+        live.replaceMediaItem(index, upgraded)
+        TrackLog.d("BitChord", "next track will start on ${stream.format.summary}", about = nextId)
         return true
     }
 
@@ -6993,6 +7204,8 @@ class PlaybackService : MediaLibraryService() {
                     // repeat: it returns immediately unless the track is
                     // pending and nothing is already looking.
                     lookForBetterCopy(player)
+                    prepareNextBest(player)
+                    reportToSpotifyPresence(player, true)
                 }
                 delay(PROGRESS_SAMPLE_MS)
             }
@@ -10020,7 +10233,15 @@ class PlaybackService : MediaLibraryService() {
         const val UPGRADE_HANDOVER_TIMEOUT_MS = 15_000L
         const val UPGRADE_HANDOVER_FADE_MS = 600L
         const val UPGRADE_HANDOVER_RESYNC_MS = 400L
-        const val UPGRADE_HANDOVER_MAX_DRIFT_MS = 30L
+        const val UPGRADE_HANDOVER_MAX_DRIFT_MS = 15L
+        const val UPGRADE_HANDOVER_ACCEPT_DRIFT_MS = 50L
+        const val UPGRADE_HANDOVER_ALIGN_TRIES = 5
+        const val UPGRADE_HANDOVER_FIRST_SEEK_LEAD_MS = 120L
+        const val UPGRADE_HANDOVER_MIN_LEAD_MS = 5_000L
+
+        /** Next-track preparation, see [prepareNextBest]. */
+        const val NEXT_BEST_FLOOR_KBPS = 140
+        const val NEXT_BEST_HEAD_BYTES = 2L * 1024 * 1024
         const val UPGRADE_HANDOVER_MIN_TAIL_MS = 3_000L
 
         /**

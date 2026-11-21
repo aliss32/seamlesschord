@@ -150,6 +150,7 @@ fun AudioPipelineDialog(
     isPlaying: Boolean = false,
 ) {
     val nerdStats by NerdStats.current.collectAsStateWithLifecycle()
+    val presenceStatus by com.music.bitchord.presence.SpotifyPresence.status.collectAsStateWithLifecycle()
     val outputStatus by AudioOutputStatus.current.collectAsStateWithLifecycle()
     val bitPerfect by BitPerfectOutput.status.collectAsStateWithLifecycle()
 
@@ -291,6 +292,11 @@ fun AudioPipelineDialog(
                 PipelineRow(stringResource(R.string.pipeline_bitrate), bitrate)
                 PipelineRow(stringResource(R.string.pipeline_pcm_data_rate), pcmDataRate)
                 PipelineRow(stringResource(R.string.pipeline_channels), channels)
+                // Only while the Spotify activity is running, so the line is the answer to
+                // "is it working" and absent when it is not in use.
+                if (presenceStatus.state != com.music.bitchord.presence.PresenceState.OFF) {
+                    PipelineRow(stringResource(R.string.spotify_presence), presenceStatusText(presenceStatus))
+                }
             }
 
             // 2. Decoder Stage

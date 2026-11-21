@@ -2,6 +2,11 @@ package com.music.bitchord.ui.screens
 
 import com.music.bitchord.ui.icons.SfIcons
 import com.music.bitchord.auth.clearSpotifyWebSession
+import android.content.Intent
+import androidx.compose.ui.platform.LocalContext
+import com.music.bitchord.presence.SpotifyPresence
+import com.music.bitchord.presence.SpotifyPresenceActivity
+import com.music.bitchord.ui.components.presenceStatusText
 import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.HorizontalDivider
 import com.music.bitchord.sharedui.resources.Res
@@ -66,6 +71,9 @@ fun AccountAndScrobblingScreen(
     val discordUsername by AppSettings.discordUsername.collectAsStateWithLifecycle()
     val discordRpcEnabled by AppSettings.discordRpcEnabled.collectAsStateWithLifecycle()
     val spotifyConnected by AppSettings.spotifySpdcToken.collectAsStateWithLifecycle()
+    val presenceEnabled by AppSettings.spotifyPresenceEnabled.collectAsStateWithLifecycle()
+    val presenceStatus by SpotifyPresence.status.collectAsStateWithLifecycle()
+    val context = LocalContext.current
 
     Column(
         modifier = modifier
@@ -120,6 +128,38 @@ fun AccountAndScrobblingScreen(
                     onClick = {
                         clearSpotifyWebSession()
                         AppSettings.setSpotifySpdcToken("")
+                    },
+                )
+            }
+        }
+
+        if (spotifyConnected.isNotBlank()) {
+            SettingsGroup(
+                header = stringResource(R.string.spotify_presence),
+                footer = stringResource(R.string.spotify_presence_footer),
+            ) {
+                SettingsRow(
+                    icon = SfIcons.GraphicEq,
+                    title = stringResource(R.string.spotify_presence_toggle),
+                    subtitle = if (presenceEnabled) presenceStatusText(presenceStatus) else stringResource(R.string.off),
+                    trailing = {
+                        IosSwitch(
+                            checked = presenceEnabled,
+                            onCheckedChange = AppSettings::setSpotifyPresenceEnabled,
+                        )
+                    },
+                    onClick = { AppSettings.setSpotifyPresenceEnabled(!presenceEnabled) },
+                )
+                FullWidthDivider()
+                SettingsRow(
+                    icon = SfIcons.Tune,
+                    title = stringResource(R.string.spotify_presence_view),
+                    subtitle = stringResource(R.string.spotify_presence_view_subtitle),
+                    onClick = {
+                        context.startActivity(
+                            Intent(context, SpotifyPresenceActivity::class.java)
+                                .putExtra(SpotifyPresenceActivity.EXTRA_SPDC, spotifyConnected),
+                        )
                     },
                 )
             }

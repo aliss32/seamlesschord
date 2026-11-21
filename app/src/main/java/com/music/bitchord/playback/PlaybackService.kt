@@ -3505,7 +3505,7 @@ class PlaybackService : MediaLibraryService() {
         .setRenderersFactory(silenceSkippingRenderers(spatial, equalizer, filter, loudness))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
-        .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
+        .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession && !SpotifyPresence.ignoreFocus.value)
         .setHandleAudioBecomingNoisy(ownsSession)
         // Keeps the CPU awake while this player is playing. Normal output gets
         // that from Android's audio server, but direct USB and AAudio exclusive
@@ -3580,7 +3580,8 @@ class PlaybackService : MediaLibraryService() {
      * the song you are listening to, which is whichever one the session is on.
      */
     private fun setSessionOwner(target: ExoPlayer, owns: Boolean) {
-        target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
+        // While the muted Spotify app is up it takes audio focus; this player must not give way to it.
+        target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns && !SpotifyPresence.ignoreFocus.value)
         target.setHandleAudioBecomingNoisy(owns)
     }
 
@@ -7732,6 +7733,10 @@ class PlaybackService : MediaLibraryService() {
 
     private fun observeSettings() {
         scope.launch {
+            // The active player is always the session owner.
+            SpotifyPresence.ignoreFocus.drop(1).collect { player?.let { p -> setSessionOwner(p, owns = true) } }
+        }
+        scope.launch {
             AppSettings.skipSilence.collect { on -> eachPlayer { it.skipSilenceEnabled = on } }
         }
         scope.launch {
@@ -8310,6 +8315,8 @@ class PlaybackService : MediaLibraryService() {
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
+        // Swiped away with nothing playing: the Spotify app and its settings go back to normal now.
+        if (player?.isPlaying != true) SpotifyPresence.endSession()
         if (AppSettings.stopOnTaskRemoved.value) {
             // A receiver left playing with nothing on the phone to drive it
             // would run out its few queued tracks and stop on its own anyway;

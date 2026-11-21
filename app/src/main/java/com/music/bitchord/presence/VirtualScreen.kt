@@ -45,7 +45,8 @@ internal object VirtualScreen {
                 HEIGHT,
                 DPI,
                 images.surface,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+                // Public, so that an app started from outside (as root) is allowed to be put on it.
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
             )
             if (created == null) {
                 images.close()

@@ -8,6 +8,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
+import java.io.File
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -30,6 +32,12 @@ object SpotifyPresence {
 
     val status = MutableStateFlow(Status())
 
+    /**
+     * True while the muted Spotify app is up. It takes audio focus (it does not
+     * play without it), and the player must not give way to that.
+     */
+    val ignoreFocus = MutableStateFlow(false)
+
     private data class Track(val id: String, val title: String, val artist: String, val durationSec: Int?)
 
     private const val DEBOUNCE_MS = 4_000L
@@ -45,10 +53,13 @@ object SpotifyPresence {
     private var spotifyUp = false
     private var startedFor: String? = null
     private var rootChecked = false
+    private var beat: Job? = null
 
     fun init(context: Context) {
         if (app != null) return
         app = context.applicationContext
+        RootSpotify.ownPackage = context.packageName
+        RootSpotify.beatFile = File(context.filesDir, "presence.beat").absolutePath
         scope.launch {
             combine(AppSettings.spotifyPresenceEnabled, AppSettings.spotifySpdcToken) { on, token ->
                 on && token.isNotBlank()
@@ -131,12 +142,16 @@ object SpotifyPresence {
         if (lookup.id == null && !fallback) {
             // Whatever Spotify was last playing must not stay up as if it were this.
             if (spotifyUp) withContext(Dispatchers.IO) { RootSpotify.stop() }
+            stopKeepAlive()
             spotifyUp = false
             startedFor = null
+            ignoreFocus.value = false
             status.value = Status(PresenceState.NOT_FOUND)
             return
         }
         status.value = Status(PresenceState.STARTING, "opening it in the Spotify app")
+        ignoreFocus.value = true
+        withContext(Dispatchers.IO) { startKeepAlive() }
         val screen = app?.let { withContext(Dispatchers.IO) { VirtualScreen.open(it) } }
         val problem = withContext(Dispatchers.IO) {
             val id = lookup.id
@@ -154,14 +169,37 @@ object SpotifyPresence {
             result
         }
         if (problem != null) {
+            // Not playing: nothing is left half-started, muted or holding the player's focus.
+            withContext(Dispatchers.IO) { RootSpotify.stop() }
+            stopKeepAlive()
             spotifyUp = false
             startedFor = null
+            ignoreFocus.value = false
             status.value = Status(PresenceState.ERROR, problem)
             return
         }
         spotifyUp = true
         startedFor = track.id
         status.value = Status(PresenceState.PLAYING, "muted, hidden screen")
+    }
+
+    /** The heartbeat the root watchdog reads, and the watchdog itself. */
+    private suspend fun startKeepAlive() {
+        val file = RootSpotify.beatFile ?: return
+        runCatching { File(file).writeText(System.currentTimeMillis().toString()) }
+        RootSpotify.startWatchdog()
+        if (beat?.isActive == true) return
+        beat = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                runCatching { File(file).writeText(System.currentTimeMillis().toString()) }
+                delay(5_000)
+            }
+        }
+    }
+
+    private fun stopKeepAlive() {
+        beat?.cancel()
+        beat = null
     }
 
     /**
@@ -178,6 +216,8 @@ object SpotifyPresence {
         startedFor = null
         rootChecked = false
         status.value = Status()
+        stopKeepAlive()
+        ignoreFocus.value = false
         VirtualScreen.close()
         if (wasUp) Thread { RootSpotify.stop() }.start()
     }
@@ -192,6 +232,8 @@ object SpotifyPresence {
         startedFor = null
         rootChecked = false
         status.value = Status()
+        stopKeepAlive()
+        ignoreFocus.value = false
         VirtualScreen.close()
         if (wasUp) scope.launch(Dispatchers.IO) { RootSpotify.stop() }
     }

@@ -101,32 +101,69 @@ internal object RootSpotify {
         return launch(args, displayId, "search")
     }
 
+    /** Where the app's own files are: the watchdog reads the heartbeat file from here. Set once at start-up. */
+    @Volatile
+    var beatFile: String? = null
+
+    @Volatile
+    var ownPackage: String = "com.seamless.chord"
+
+    private const val WATCHDOG_PID = "/data/local/tmp/seamless-watchdog.pid"
+    private const val STATE_PLAYING = 3
+    private const val POLLS = 8
+    private const val POLL_MS = 1_500L
+
+    /** What the Spotify app's media session says it is doing (3 = playing); null when it has no session. */
+    private fun mediaState(): Int? {
+        val dump = su("dumpsys media_session", 15).out
+        var inSpotify = false
+        for (line in dump.lines()) {
+            if (line.contains("package=")) inSpotify = line.contains(PACKAGE)
+            if (inSpotify && line.contains("state=PlaybackState")) {
+                return Regex("""state=(\d+)""").find(line)?.groupValues?.get(1)?.toIntOrNull()
+            }
+        }
+        return null
+    }
+
+    /** The screens Spotify is the resumed app on ("0" is the real one). */
+    private fun spotifyDisplays(): Set<String> {
+        val dump = su("dumpsys activity activities", 15).out
+        var display = "?"
+        val found = mutableSetOf<String>()
+        for (line in dump.lines()) {
+            Regex("""^\s*Display #(\d+)""").find(line)?.let { display = it.groupValues[1] }
+            if (line.contains("ResumedActivity") && line.contains(PACKAGE)) found += display
+        }
+        return found
+    }
+
+    /** What is worth knowing when Spotify did not play: the focus stack and Spotify's audio players. */
+    private fun diagnose(state: Int?, displays: Set<String>) {
+        log("  media session state: ${state ?: "no session"}; resumed on display: ${displays.ifEmpty { setOf("none") }.joinToString()}")
+        val audio = su("dumpsys audio", 15).out.lines()
+        val focus = audio.indexOfFirst { it.contains("Audio Focus stack", ignoreCase = true) }
+        if (focus >= 0) audio.drop(focus).take(4).forEach { log("  ${it.trim().take(140)}") }
+        audio.filter { it.contains("spotify", ignoreCase = true) }.take(4).forEach { log("  ${it.trim().take(140)}") }
+    }
+
     /**
-     * Muted, started on the hidden screen when there is one. If Spotify
-     * nevertheless comes up on the real screen, it is sent straight back.
-     * Returns null on success, or what went wrong.
+     * Muted, started on the hidden screen when there is one, then checked:
+     * the Spotify app has to report that it really is playing. Returns null on
+     * success, or what went wrong.
      */
     private fun launch(intentArgs: String, displayId: Int?, what: String): String? = synchronized(shellLock) {
         val display = if (displayId != null) "--display $displayId " else ""
-        val tries = if (displayId != null) 8 else 30
+        // Muted at the system, but allowed to take audio focus: a Spotify that is refused focus does not play at all.
         val script = """
             cmd appops set $PACKAGE PLAY_AUDIO deny
-            cmd appops set $PACKAGE TAKE_AUDIO_FOCUS deny
+            cmd appops set $PACKAGE TAKE_AUDIO_FOCUS allow
             am start $display$intentArgs -p $PACKAGE --activity-no-animation
-            for n in ${(1..tries).joinToString(" ")}; do
-              if dumpsys activity activities | grep -m1 -E 'topResumedActivity|mResumedActivity' | grep -q $PACKAGE; then
-                echo "spotify came up on the real screen"
-                sleep 1
-                input keyevent 4
-                break
-              fi
-              sleep 0.3
-            done
             cmd appops get $PACKAGE PLAY_AUDIO
         """.trimIndent()
-        val result = su(script, timeoutSec = 40)
+        val result = su(script, timeoutSec = 30)
         log("play ($what, display ${displayId ?: "real"}): code ${result.code}")
-        result.out.lines().filter { it.isNotBlank() }.takeLast(10).forEach { log("  $it") }
+        result.out.lines().filter { it.isNotBlank() }.takeLast(6).forEach { log("  $it") }
         if (result.code < 0) return result.out
         if (result.out.contains("Error", ignoreCase = true) && result.out.contains("not started", ignoreCase = true)) {
             return "the Spotify app did not accept the request"
@@ -134,14 +171,68 @@ internal object RootSpotify {
         if (!result.out.contains("deny", ignoreCase = true)) {
             log("  warning: PLAY_AUDIO does not read as denied; the track may be audible")
         }
-        return null
+        var state: Int? = null
+        var displays = emptySet<String>()
+        var wentBack = false
+        for (poll in 1..POLLS) {
+            Thread.sleep(POLL_MS)
+            if (!wentBack) {
+                displays = spotifyDisplays()
+                if ("0" in displays) {
+                    // It is on the real screen after all: back to what was there before.
+                    log("  spotify is on the real screen; sending Back")
+                    su("input keyevent 4")
+                    wentBack = true
+                }
+            }
+            state = mediaState()
+            if (state == STATE_PLAYING) {
+                log("  spotify is playing (poll $poll)")
+                return null
+            }
+        }
+        diagnose(state, displays)
+        return "Spotify did not start playing (state ${state ?: "no session"})"
     }
 
-    /** Stops Spotify and puts its audio settings back. */
+    /**
+     * A small root script that outlives this app. While the app is alive and
+     * keeps touching its heartbeat file, it does nothing; the moment the app
+     * is gone (swiped away, killed, crashed) or goes quiet, it stops Spotify
+     * and puts its sound back. This is what makes sure Spotify is never left
+     * muted, whatever happens to the app.
+     */
+    fun startWatchdog() {
+        val beat = beatFile ?: return
+        val script = """
+            [ -f $WATCHDOG_PID ] && kill ${'$'}(cat $WATCHDOG_PID) 2>/dev/null
+            setsid nohup sh -c '
+              echo ${'$'}${'$'} > $WATCHDOG_PID
+              while true; do
+                sleep 3
+                pid=${'$'}(pidof $ownPackage)
+                last=${'$'}(stat -c %Y "$beat" 2>/dev/null || echo 0)
+                now=${'$'}(date +%s)
+                if [ -z "${'$'}pid" ] || [ ${'$'}((now - last)) -gt 40 ]; then
+                  am force-stop $PACKAGE
+                  cmd appops set $PACKAGE PLAY_AUDIO default
+                  cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default
+                  rm -f $WATCHDOG_PID
+                  exit 0
+                fi
+              done
+            ' >/dev/null 2>&1 </dev/null &
+        """.trimIndent()
+        val result = su(script, 10)
+        log("watchdog: code ${result.code}")
+    }
+
+    /** Stops Spotify, puts its audio settings back and retires the watchdog. */
     fun stop() {
         synchronized(shellLock) {
             val result = su(
-                "am force-stop $PACKAGE; " +
+                "[ -f $WATCHDOG_PID ] && kill \$(cat $WATCHDOG_PID) 2>/dev/null; rm -f $WATCHDOG_PID; " +
+                    "am force-stop $PACKAGE; " +
                     "cmd appops set $PACKAGE PLAY_AUDIO default; " +
                     "cmd appops set $PACKAGE TAKE_AUDIO_FOCUS default",
             )

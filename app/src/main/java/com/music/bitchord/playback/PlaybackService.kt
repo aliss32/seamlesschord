@@ -2644,6 +2644,45 @@ class PlaybackService : MediaLibraryService() {
         )
     }
 
+    /**
+     * [adoptPlayerForVersionSwap] for a better copy of the track that is
+     * already playing: the same handoff, minus the "a new track became
+     * current" bookkeeping that would reset the track's stats, loudness and
+     * history — nothing about the track changed, only where its audio comes from.
+     */
+    private fun adoptPlayerForUpgrade(outgoing: ExoPlayer, incoming: ExoPlayer) {
+        setSessionOwner(outgoing, owns = false)
+        setSessionOwner(incoming, owns = true)
+
+        outgoing.removeListener(playbackListener)
+        outgoing.removeAnalyticsListener(formatListener)
+
+        player = incoming
+        spare = outgoing
+
+        val heldFilter = activeFilter
+        activeFilter = spareFilter
+        spareFilter = heldFilter
+
+        incoming.addListener(playbackListener)
+        incoming.addAnalyticsListener(formatListener)
+        adoptFormatOf(incoming)
+        // The decoder reported its format while the listener was still on the
+        // outgoing player; carry it over so the readout names the new stream.
+        incoming.audioFormat?.let { currentAudioInputFormat = it }
+
+        mediaSession?.player = newSessionPlayer(incoming, requireNotNull(crossfade))
+
+        incoming.volume = 1f
+        outgoing.stop()
+        outgoing.clearMediaItems()
+        outgoing.volume = 1f
+
+        activeTrackIsDolbyAtmos = NerdStats.declaredFormat(incoming.currentMediaItem?.mediaId)?.isDolbyAtmos == true
+        applySpatialAudioEnabled()
+        refreshCustomLayouts()
+    }
+
     /** Reopens the current song through YouTube and remembers that choice. */
     private fun revertCurrentToOriginal() {
         val activePlayer = player ?: return
@@ -4988,6 +5027,14 @@ class PlaybackService : MediaLibraryService() {
                 )
             }
 
+            // Playing audio is never cut for this: the old stream keeps going
+            // while the new one is brought up silently on the spare player, and
+            // only once that has held steady is it faded in. What follows —
+            // the hard cut — remains for the cases with nothing audible to
+            // protect (paused, a party, no spare player). See
+            // [handOverSeamlessly].
+            if (handOverSeamlessly(mediaId, now, upgradedUri, stream)) return@withContext
+
             // Read before the swap overwrites it — see [watchUpgrade]'s
             // NerdStats cleanup for why the pre-upgrade claim has to be
             // captured here rather than looked up again on revert.
@@ -5057,6 +5104,249 @@ class PlaybackService : MediaLibraryService() {
                 }
             }
         }
+    }
+
+    /**
+     * Moves the playing track onto [stream] without an audible cut, or reports
+     * that it cannot.
+     *
+     * The old stream keeps playing the whole time. The upgraded one is opened
+     * on the spare player at zero volume, started in lock-step with the
+     * listener's position, and has to stay in `STATE_READY` and actually
+     * advancing for [UPGRADE_HANDOVER_HOLD_MS] before it is trusted. Only then
+     * are the two cross-faded and the spare adopted as the session player —
+     * the same mechanism a version switch uses, so there is no
+     * `replaceMediaItem` and no rebuild of the source under the listener.
+     *
+     * Anything that goes wrong along the way happens on a player nobody is
+     * hearing, and the answer is that nothing changes: the listener keeps the
+     * stream they already had. A stream that failed to prove itself is dropped
+     * like a failed audition; one that merely ran out of track or moment is
+     * shelved for a return visit.
+     *
+     * @return true when the upgrade was handled here — landed, shelved or
+     *   dropped — and false when there is nothing audible to protect, or no
+     *   spare player to do it with, and the caller should make the plain swap.
+     */
+    private suspend fun handOverSeamlessly(
+        mediaId: String,
+        at: SwapPoint,
+        upgradedUri: String,
+        stream: SourceStream,
+    ): Boolean {
+        val activePlayer = player ?: return false
+        val standby = spare ?: return false
+        if (crossfade == null) return false
+        // A party plays the one cut everybody has, and a paused track has no
+        // audio for a cut to interrupt — the plain swap is right for both.
+        if (ListenTogether.state.value.inParty || !activePlayer.isPlaying) return false
+        if (versionSwapJob?.isActive == true) {
+            // The spare is busy with a version switch. Not a failure of the
+            // stream, so it is kept for the next look rather than thrown away.
+            QualityUpgrade.shelve(mediaId, stream)
+            TrackLog.d("BitChord", "upgrade for $mediaId shelved: a version switch was using the spare player")
+            return true
+        }
+
+        val currentIndex = activePlayer.currentMediaItemIndex
+        val previousFormat = NerdStats.declaredFormat(mediaId)
+        val upgradedItem = at.item.buildUpon()
+            .setUri(upgradedUri)
+            .setMediaMetadata(
+                at.item.mediaMetadata.buildUpon()
+                    .setExtras(
+                        Bundle(at.item.mediaMetadata.extras ?: Bundle()).apply {
+                            putBoolean(EXTRA_QUALITY_UPGRADED, true)
+                        },
+                    )
+                    .build(),
+            )
+            .withResolvedStreamType(stream.url)
+            .build()
+
+        // Claims the spare the way a version switch does, so Automix does not
+        // arm onto it mid-handover — see [versionSwapActive].
+        val generation = ++versionSwapGeneration
+        val finished = CompletableDeferred<Unit>()
+        versionSwapJob = scope.launch(Dispatchers.Main) {
+            var landed = false
+            var drop = false
+            fun stillHere(): Boolean = player === activePlayer &&
+                activePlayer.currentMediaItemIndex == currentIndex &&
+                activePlayer.currentMediaItem?.mediaId == mediaId
+            try {
+                val items = (0 until activePlayer.mediaItemCount).map { i ->
+                    if (i == currentIndex) upgradedItem else activePlayer.getMediaItemAt(i)
+                }
+                standby.stop()
+                standby.clearMediaItems()
+                standby.skipSilenceEnabled = activePlayer.skipSilenceEnabled
+                standby.repeatMode = activePlayer.repeatMode
+                standby.shuffleModeEnabled = activePlayer.shuffleModeEnabled
+                standby.setPlaybackSpeed(AppSettings.playbackSpeed.value)
+                standby.volume = 0f
+                standby.setMediaItems(items, currentIndex, activePlayer.currentPosition)
+                spareLoudness().track(mediaId, nextMediaIdOf(standby))
+                standby.playWhenReady = false
+                standby.prepare()
+
+                // 1. The new stream opens and buffers while the old one plays.
+                val readyBy = SystemClock.elapsedRealtime() + UPGRADE_HANDOVER_READY_MS
+                while (standby.playbackState != Player.STATE_READY) {
+                    if (!stillHere() || !activePlayer.playWhenReady) return@launch
+                    if (standby.playerError != null || SystemClock.elapsedRealtime() > readyBy) {
+                        TrackLog.w("BitChord", "upgrade for $mediaId never became ready on the spare player; keeping the current stream", about = mediaId)
+                        drop = true
+                        return@launch
+                    }
+                    delay(20)
+                }
+                // The audition already compared lengths, but this is the stream
+                // as the real pipeline opened it.
+                val upgradedLength = standby.duration
+                if (at.duration > 0 && upgradedLength > 0 &&
+                    abs(upgradedLength - at.duration) > upgradeLengthSlackMs
+                ) {
+                    TrackLog.w("BitChord", "upgrade for $mediaId disagrees about the length (${upgradedLength}ms against ${at.duration}ms); keeping the current stream", about = mediaId)
+                    drop = true
+                    return@launch
+                }
+
+                // 2. Run it silently, next to the old one, until it has held
+                //    steady for a while. Any stumble restarts the clock.
+                standby.seekTo(currentIndex, activePlayer.currentPosition)
+                standby.play()
+                var steadySince = SystemClock.elapsedRealtime()
+                val steadyBy = steadySince + UPGRADE_HANDOVER_TIMEOUT_MS
+                while (true) {
+                    if (!stillHere() || !activePlayer.playWhenReady) return@launch
+                    if (standby.playerError != null) {
+                        drop = true
+                        return@launch
+                    }
+                    val t = SystemClock.elapsedRealtime()
+                    if (standby.isPlaying && standby.playbackState == Player.STATE_READY) {
+                        if (t - steadySince >= UPGRADE_HANDOVER_HOLD_MS) break
+                    } else {
+                        steadySince = t
+                    }
+                    if (t > steadyBy) {
+                        TrackLog.w("BitChord", "upgrade for $mediaId never held steady on the spare player; keeping the current stream", about = mediaId)
+                        drop = true
+                        return@launch
+                    }
+                    delay(20)
+                }
+
+                // 3. Line the two up on the listener's position, as it is now.
+                val drift = standby.currentPosition - activePlayer.currentPosition
+                if (abs(drift) > UPGRADE_HANDOVER_MAX_DRIFT_MS) {
+                    standby.seekTo(currentIndex, activePlayer.currentPosition)
+                    val resyncBy = SystemClock.elapsedRealtime() + UPGRADE_HANDOVER_RESYNC_MS
+                    while (isActive && !(standby.playbackState == Player.STATE_READY && standby.isPlaying) &&
+                        SystemClock.elapsedRealtime() < resyncBy
+                    ) {
+                        delay(10)
+                    }
+                    if (!standby.isPlaying) {
+                        TrackLog.w("BitChord", "upgrade for $mediaId did not resume after aligning; keeping the current stream", about = mediaId)
+                        drop = true
+                        return@launch
+                    }
+                }
+                if (!stillHere()) return@launch
+                if (activePlayer.duration > 0 &&
+                    activePlayer.duration - activePlayer.currentPosition < UPGRADE_HANDOVER_MIN_TAIL_MS
+                ) {
+                    TrackLog.d("BitChord", "upgrade abandoned: the track ran out while the new stream was held", about = mediaId)
+                    drop = true
+                    return@launch
+                }
+
+                // 4. Equal-power cross-fade from the old stream to the new one.
+                val fadeStart = SystemClock.elapsedRealtime()
+                try {
+                    while (true) {
+                        if (!stillHere()) return@launch
+                        if (standby.playWhenReady != activePlayer.playWhenReady) {
+                            standby.playWhenReady = activePlayer.playWhenReady
+                        }
+                        val progress = ((SystemClock.elapsedRealtime() - fadeStart).toFloat() /
+                            UPGRADE_HANDOVER_FADE_MS).coerceIn(0f, 1f)
+                        val inGain = sin(progress * (PI / 2.0)).toFloat()
+                        val outGain = cos(progress * (PI / 2.0)).toFloat()
+                        standby.volume = inGain
+                        activePlayer.volume = outGain
+                        val trim = 1f / sqrt((inGain + outGain).coerceAtLeast(1f))
+                        loudnessA.setBlendTrim(trim)
+                        loudnessB.setBlendTrim(trim)
+                        if (progress >= 1f) break
+                        delay(16)
+                    }
+                } finally {
+                    loudnessA.setBlendTrim(1f)
+                    loudnessB.setBlendTrim(1f)
+                }
+
+                // 5. The spare becomes the session player.
+                val position = standby.currentPosition
+                adoptPlayerForUpgrade(outgoing = activePlayer, incoming = standby)
+                landed = true
+
+                val upgradedSourceName = stream.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
+                    ?: "Upgrade"
+                NerdStats.onSourceStream(mediaId, stream.format, upgradedSourceName)
+                NerdStats.recordSource(mediaId, upgradedSourceName)
+                QualityUpgrade.unshelve(mediaId)
+                TrackLog.d(
+                    "BitChord",
+                    "upgraded to ${stream.format.summary} at ${position}ms ($upgradedSourceName), no cut",
+                    about = mediaId,
+                )
+                watchUpgrade(mediaId, at.uri, position, at.duration, previousFormat)
+                if (QualityUpgrade.continueAfterLossySwap(mediaId)) {
+                    val firstPass = upgradeJob
+                    scope.launch {
+                        firstPass?.join()
+                        this@PlaybackService.player?.let { lookForBetterCopy(it) }
+                    }
+                }
+                if (!ListenTogether.state.value.inParty) {
+                    launch(Dispatchers.IO) {
+                        AudioCache.warmRange(Uri.parse(upgradedUri), 0, ANALYSIS_HEAD_BYTES)
+                    }
+                }
+            } finally {
+                if (!landed) {
+                    // Nothing was ever cut, so there is nothing to put back —
+                    // only the spare to release, unless a version switch has
+                    // already taken it over.
+                    if (generation == versionSwapGeneration) {
+                        standby.stop()
+                        standby.clearMediaItems()
+                        standby.volume = 1f
+                        activePlayer.volume = 1f
+                        loudnessA.setBlendTrim(1f)
+                        loudnessB.setBlendTrim(1f)
+                    }
+                    if (drop) {
+                        QualityUpgrade.forget(mediaId)
+                        scope.launch(Dispatchers.IO) {
+                            // The spare has only just let go of the entry.
+                            delay(RECOVERY_DELAY_MS)
+                            AudioCache.discardRendition(Uri.parse(upgradedUri))
+                        }
+                    } else {
+                        QualityUpgrade.shelve(mediaId, stream)
+                        TrackLog.d("BitChord", "upgrade for $mediaId shelved: the moment passed before the hand-over", about = mediaId)
+                    }
+                }
+                finished.complete(Unit)
+            }
+        }
+        // Held here so the "Upgrading quality" badge stays up for the whole of it.
+        finished.await()
+        return true
     }
 
     /** Main thread. Null unless [mediaId] is still current and has another upgrade slot. */
@@ -9718,6 +10008,20 @@ class PlaybackService : MediaLibraryService() {
 
         /** Loaded media bytes an audition needs before its buffered position is believed. */
         const val MIN_PROVEN_LOAD_BYTES = UPGRADE_HEADER_BYTES
+
+        /**
+         * Hand-over of a proven upgrade, see [handOverSeamlessly]. The new
+         * stream plays silently beside the old one for [UPGRADE_HANDOVER_HOLD_MS]
+         * without stumbling before it is cross-faded in; the old one carries on
+         * being heard throughout, so none of these are silence.
+         */
+        const val UPGRADE_HANDOVER_READY_MS = 8_000L
+        const val UPGRADE_HANDOVER_HOLD_MS = 1_000L
+        const val UPGRADE_HANDOVER_TIMEOUT_MS = 15_000L
+        const val UPGRADE_HANDOVER_FADE_MS = 600L
+        const val UPGRADE_HANDOVER_RESYNC_MS = 400L
+        const val UPGRADE_HANDOVER_MAX_DRIFT_MS = 30L
+        const val UPGRADE_HANDOVER_MIN_TAIL_MS = 3_000L
 
         /**
          * Opening fetched after an upgrade so the track stays analysable. Four

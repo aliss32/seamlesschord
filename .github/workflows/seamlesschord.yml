@@ -1,0 +1,154 @@
+name: SeamlessChord Release APK
+
+# Builds the app as a separate install ("SeamlessChord", package
+# com.seamless.chord) so it sits next to the regular BitChord on the same
+# device instead of replacing it. Nothing in the repository is edited: the
+# package id and label are rewritten inside the CI checkout only.
+#
+# Run it from the Actions tab -> "SeamlessChord Release APK" -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: seamlesschord
+  cancel-in-progress: true
+
+env:
+  SEAMLESS_APPLICATION_ID: com.seamless.chord
+  SEAMLESS_APP_NAME: SeamlessChord
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # ---- Different package + name, CI checkout only -----------------------
+      - name: Rename the dev flavor to SeamlessChord
+        run: |
+          set -e
+          sed -i "s|applicationId = \"com.dev.bitchord\"|applicationId = \"${SEAMLESS_APPLICATION_ID}\"|" app/build.gradle.kts
+          sed -i "s|resValue(\"string\", \"app_name\", \"BitChord Dev\")|resValue(\"string\", \"app_name\", \"${SEAMLESS_APP_NAME}\")|" app/build.gradle.kts
+          sed -i "s|android:label=\"BitChord Dev\"|android:label=\"${SEAMLESS_APP_NAME}\"|" app/src/dev/AndroidManifest.xml
+          # Fail loudly if upstream changed those lines, rather than quietly
+          # building something that would overwrite the dev app.
+          grep -q "applicationId = \"${SEAMLESS_APPLICATION_ID}\"" app/build.gradle.kts
+          grep -q "\"${SEAMLESS_APP_NAME}\")" app/build.gradle.kts
+          grep -q "android:label=\"${SEAMLESS_APP_NAME}\"" app/src/dev/AndroidManifest.xml
+
+      - name: Write local.properties
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          LISTEN_TOGETHER_SERVER: ${{ secrets.LISTEN_TOGETHER_SERVER }}
+        run: |
+          : > local.properties
+          # Only written when set: an empty value would replace the built-in default.
+          [ -z "$LASTFM_API_KEY" ] || echo "LASTFM_API_KEY=$LASTFM_API_KEY" >> local.properties
+          [ -z "$LASTFM_SECRET" ] || echo "LASTFM_SECRET=$LASTFM_SECRET" >> local.properties
+          [ -z "$LISTEN_TOGETHER_SERVER" ] || echo "LISTEN_TOGETHER_SERVER=$LISTEN_TOGETHER_SERVER" >> local.properties
+
+      # ---- Signing: its own key, unrelated to BitChord's ---------------------
+      # Preferred: SEAMLESS_KEYSTORE_BASE64 / SEAMLESS_KEYSTORE_PASSWORD secrets.
+      # Fallback: generate a key once and keep it in the Actions cache so later
+      # builds are signed the same way and install as updates.
+      - name: Restore generated keystore (fallback)
+        uses: actions/cache@v4
+        with:
+          path: .seamless-signing
+          key: seamlesschord-keystore-v1
+
+      - name: Prepare keystore
+        env:
+          KS_B64: ${{ secrets.SEAMLESS_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.SEAMLESS_KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          mkdir -p .seamless-signing
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ]; then
+            echo "$KS_B64" | base64 -d > seamlesschord.jks
+            PASS="$KS_PASS"
+            ALIAS=seamlesschord
+            echo "Using keystore from secrets."
+          else
+            if [ ! -f .seamless-signing/seamlesschord.jks ]; then
+              echo "Generating a new SeamlessChord keystore."
+              openssl rand -hex 16 > .seamless-signing/pass.txt
+              keytool -genkeypair -v \
+                -keystore .seamless-signing/seamlesschord.jks \
+                -alias seamlesschord -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass "$(cat .seamless-signing/pass.txt)" \
+                -keypass "$(cat .seamless-signing/pass.txt)" \
+                -dname "CN=SeamlessChord, O=SeamlessChord, C=TR"
+            else
+              echo "Reusing cached SeamlessChord keystore."
+            fi
+            cp .seamless-signing/seamlesschord.jks seamlesschord.jks
+            PASS="$(cat .seamless-signing/pass.txt)"
+            ALIAS=seamlesschord
+          fi
+          {
+            echo "storeFile=seamlesschord.jks"
+            echo "storePassword=$PASS"
+            echo "keyAlias=$ALIAS"
+            echo "keyPassword=$PASS"
+          } > keystore.properties
+
+      - run: chmod +x gradlew
+
+      - name: Build signed release APK
+        run: ./gradlew :app:assembleDevRelease --stacktrace
+
+      - name: Collect APKs and verify
+        id: apk
+        run: |
+          set -e
+          mkdir -p dist
+          TAG="seamless-${GITHUB_RUN_NUMBER}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          for f in app/build/outputs/apk/dev/release/*.apk; do
+            case "$f" in
+              *universal*)  cp "$f" "dist/SeamlessChord-${TAG}-universal.apk" ;;
+              *arm64-v8a*)  cp "$f" "dist/SeamlessChord-${TAG}-arm64-v8a.apk" ;;
+            esac
+          done
+          ls -la dist
+          test -n "$(ls dist/*.apk 2>/dev/null)"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          for a in dist/*.apk; do
+            echo "== $a"
+            "$BT/aapt" dump badging "$a" | grep -E "^package:|application-label:"
+            "$BT/apksigner" verify --print-certs "$a" | head -3
+            # Must not be the stock package, or it would replace BitChord.
+            "$BT/aapt" dump badging "$a" | grep -q "package: name='${SEAMLESS_APPLICATION_ID}'"
+          done
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seamlesschord-release-signed
+          path: dist/*.apk
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.apk.outputs.tag }}" dist/*.apk \
+            --title "SeamlessChord ${{ steps.apk.outputs.tag }}" \
+            --notes "Separate install (${SEAMLESS_APPLICATION_ID}) with seamless quality-upgrade hand-over. Installs next to BitChord." \
+            --target "${GITHUB_SHA}"

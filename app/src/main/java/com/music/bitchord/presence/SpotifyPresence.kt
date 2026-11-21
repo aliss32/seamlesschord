@@ -152,7 +152,7 @@ object SpotifyPresence {
         status.value = Status(PresenceState.STARTING, "opening it in the Spotify app")
         ignoreFocus.value = true
         withContext(Dispatchers.IO) { startKeepAlive() }
-        val screen = app?.let { withContext(Dispatchers.IO) { VirtualScreen.open(it) } }
+        val screen = if (RootSpotify.preferReal) null else app?.let { withContext(Dispatchers.IO) { VirtualScreen.open(it) } }
         val problem = withContext(Dispatchers.IO) {
             val id = lookup.id
             fun open(display: Int?) = if (id != null) {
@@ -160,11 +160,23 @@ object SpotifyPresence {
             } else {
                 RootSpotify.playFromSearch(track.title, track.artist, display)
             }
-            var result = open(screen)
-            if (result != null && screen != null) {
-                // The system would not put Spotify on the hidden screen: a moment on the real one instead.
-                RootSpotify.log("hidden screen refused (${result.take(80)}); trying the real screen")
-                result = open(null)
+            // The hidden screen first; if Spotify does not play there (the system can refuse an app's audio
+            // focus when it is not the app in front), Spotify is stopped and tried once on the real screen.
+            val screens = if (screen != null && !RootSpotify.preferReal) listOf(screen, null) else listOf(null)
+            var result: String? = "no attempt"
+            for ((index, display) in screens.withIndex()) {
+                if (index > 0) {
+                    RootSpotify.log("not playing on the hidden screen (${result?.take(60)}); stopping Spotify, trying the real screen")
+                    RootSpotify.forceStop()
+                }
+                result = open(display)
+                if (result == null) {
+                    if (display == null && screen != null && !RootSpotify.preferReal) {
+                        RootSpotify.preferReal = true
+                        RootSpotify.log("the hidden screen does not work here; the real screen will be used from now on")
+                    }
+                    break
+                }
             }
             result
         }
@@ -172,6 +184,7 @@ object SpotifyPresence {
             // Not playing: nothing is left half-started, muted or holding the player's focus.
             withContext(Dispatchers.IO) { RootSpotify.stop() }
             stopKeepAlive()
+            VirtualScreen.close()
             spotifyUp = false
             startedFor = null
             ignoreFocus.value = false

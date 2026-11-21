@@ -2,6 +2,7 @@ package com.music.bitchord.presence
 
 import com.music.bitchord.data.canvas.SpotifyToken
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -30,6 +31,8 @@ internal object RootSpotify {
 
     private const val LOG_LINES = 150
     private const val DURATION_TOLERANCE_SEC = 8
+    private const val MAX_WAIT_MS = 30_000L
+    private const val MAX_RATE_LIMIT_TRIES = 3
 
     private val lines = ArrayDeque<String>()
 
@@ -110,7 +113,7 @@ internal object RootSpotify {
 
     private const val WATCHDOG_PID = "/data/local/tmp/seamless-watchdog.pid"
     private const val STATE_PLAYING = 3
-    private const val POLLS = 8
+    private const val POLLS = 10
     private const val POLL_MS = 1_500L
 
     /** What the Spotify app's media session says it is doing (3 = playing); null when it has no session. */
@@ -138,13 +141,19 @@ internal object RootSpotify {
         return found
     }
 
-    /** What is worth knowing when Spotify did not play: the focus stack and Spotify's audio players. */
+    /** What is worth knowing when Spotify did not play: its process state, the focus stack and its audio events. */
     private fun diagnose(state: Int?, displays: Set<String>) {
         log("  media session state: ${state ?: "no session"}; resumed on display: ${displays.ifEmpty { setOf("none") }.joinToString()}")
+        val uid = Regex("""uid:(\d+)""").find(su("pm list packages -U $PACKAGE").out)?.groupValues?.get(1)
+        if (uid != null) {
+            log("  uid $uid state: " + su("cmd activity get-uid-state $uid || am get-uid-state $uid", 8).out.lines().lastOrNull().orEmpty().take(100))
+        }
         val audio = su("dumpsys audio", 15).out.lines()
         val focus = audio.indexOfFirst { it.contains("Audio Focus stack", ignoreCase = true) }
-        if (focus >= 0) audio.drop(focus).take(4).forEach { log("  ${it.trim().take(140)}") }
-        audio.filter { it.contains("spotify", ignoreCase = true) }.take(4).forEach { log("  ${it.trim().take(140)}") }
+        if (focus >= 0) audio.drop(focus).take(3).forEach { log("  ${it.trim().take(140)}") }
+        // The newest lines last: the old ones are not what this attempt did.
+        audio.filter { it.contains("spotify", ignoreCase = true) || it.contains("AudioHardening") }
+            .takeLast(6).forEach { log("  ${it.trim().take(160)}") }
     }
 
     /**
@@ -173,21 +182,23 @@ internal object RootSpotify {
         }
         var state: Int? = null
         var displays = emptySet<String>()
-        var wentBack = false
         for (poll in 1..POLLS) {
             Thread.sleep(POLL_MS)
-            if (!wentBack) {
-                displays = spotifyDisplays()
-                if ("0" in displays) {
-                    // It is on the real screen after all: back to what was there before.
-                    log("  spotify is on the real screen; sending Back")
-                    su("input keyevent 4")
-                    wentBack = true
-                }
+            displays = spotifyDisplays()
+            // Asked for the hidden screen but it came up on the real one: out of the way at once.
+            if (displayId != null && "0" in displays) {
+                log("  spotify is on the real screen; sending Back")
+                su("input keyevent 4")
             }
             state = mediaState()
             if (state == STATE_PLAYING) {
                 log("  spotify is playing (poll $poll)")
+                // On the real screen on purpose: it has to be the app in front until it plays. Now it can go.
+                if (displayId == null && "0" in displays) {
+                    Thread.sleep(800)
+                    su("input keyevent 4")
+                    log("  sent Back")
+                }
                 return null
             }
         }
@@ -227,6 +238,15 @@ internal object RootSpotify {
         log("watchdog: code ${result.code}")
     }
 
+    /** Whether the hidden screen has been tried and found not to work on this phone (kept until the app restarts). */
+    @Volatile
+    var preferReal = false
+
+    /** Stops the Spotify app without touching its sound settings: for starting over on another screen. */
+    fun forceStop() {
+        synchronized(shellLock) { su("am force-stop $PACKAGE") }
+    }
+
     /** Stops Spotify, puts its audio settings back and retires the watchdog. */
     fun stop() {
         synchronized(shellLock) {
@@ -258,13 +278,30 @@ internal object RootSpotify {
     @Volatile
     var apiBlockedUntil = 0L
 
+    /** Tracks already matched, so skipping back and forth does not ask Spotify twice. */
+    private val matched = object : LinkedHashMap<String, String>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 200
+    }
+
     suspend fun findTrack(title: String, artist: String, durationSec: Int?): Lookup {
-        if (System.currentTimeMillis() < apiBlockedUntil) return Lookup(null, "search API is resting", limited = true)
+        val key = "${normalize(title)}|${normalize(artist)}|${durationSec ?: 0}"
+        synchronized(matched) { matched[key] }?.let {
+            log("search: cached match $it")
+            return Lookup(it)
+        }
         var token = withContext(Dispatchers.IO) { SpotifyToken.accessToken() }
         if (token.isNullOrBlank()) return Lookup(null, "Spotify sign-in is needed")
         val query = URLEncoder.encode("$title $artist".trim(), "UTF-8")
-        var attempt = 0
+        var refreshed = false
+        var rateLimited = 0
         while (true) {
+            // Just asked and told to wait: the answer comes with a time, and that time is short. Waiting it out
+            // beats the Spotify app's own search, which does not reliably start anything.
+            val resting = apiBlockedUntil - System.currentTimeMillis()
+            if (resting > 0) {
+                if (resting > MAX_WAIT_MS) return Lookup(null, "search API is resting", limited = true)
+                delay(resting + 500)
+            }
             val reply = withContext(Dispatchers.IO) {
                 runCatching {
                     val connection = URL("https://api.spotify.com/v1/search?type=track&limit=10&q=$query")
@@ -274,17 +311,23 @@ internal object RootSpotify {
                     connection.setRequestProperty("Authorization", "Bearer $token")
                     val code = connection.responseCode
                     if (code == 429) {
-                        val wait = connection.getHeaderField("Retry-After")?.trim()?.toLongOrNull() ?: 600L
-                        // Whatever it asks for, the fallback below does not need it; check back in a while.
-                        apiBlockedUntil = System.currentTimeMillis() + wait.coerceIn(60L, 1_800L) * 1_000L
-                        log("search: HTTP 429, Retry-After ${wait}s; using the Spotify app's own search meanwhile")
+                        val wait = connection.getHeaderField("Retry-After")?.trim()?.toLongOrNull() ?: 20L
+                        apiBlockedUntil = System.currentTimeMillis() + wait.coerceIn(5L, 120L) * 1_000L
+                        log("search: HTTP 429, Retry-After ${wait}s")
                     }
                     val stream = if (code in 200..299) connection.inputStream else connection.errorStream
                     code to stream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 }
             }.getOrElse { return Lookup(null, "Spotify search failed: ${it.message}", limited = true) }
             val (code, body) = reply
-            if (code == 401 && attempt++ == 0) {
+            if (code == 429) {
+                if (++rateLimited >= MAX_RATE_LIMIT_TRIES) {
+                    return Lookup(null, "Spotify search is rate limited", limited = true)
+                }
+                continue
+            }
+            if (code == 401 && !refreshed) {
+                refreshed = true
                 SpotifyToken.invalidate()
                 token = withContext(Dispatchers.IO) { SpotifyToken.accessToken() }
                 if (token.isNullOrBlank()) return Lookup(null, "Spotify sign-in is needed")
@@ -298,6 +341,7 @@ internal object RootSpotify {
                 ?: JSONArray()
             val id = bestMatch(title, artist, durationSec, items)
             log("search: ${items.length()} results, match ${id ?: "none"}")
+            if (id != null) synchronized(matched) { matched[key] = id }
             return Lookup(id)
         }
     }

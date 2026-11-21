@@ -8324,6 +8324,8 @@ class PlaybackService : MediaLibraryService() {
 
 
     override fun onDestroy() {
+        // The Spotify app and its hidden screen go with the player.
+        SpotifyPresence.endSession()
         WearBridge.attachStreams(null)
         WearBridge.releaseSpeaker()
         // Let go of the receiver's player but leave its session alone: a

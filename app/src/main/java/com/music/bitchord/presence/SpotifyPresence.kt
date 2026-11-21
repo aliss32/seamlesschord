@@ -107,7 +107,7 @@ object SpotifyPresence {
             return
         }
         if (spotifyUp && startedFor == track.id) {
-            status.value = Status(PresenceState.PLAYING, "muted, in the Spotify app")
+            status.value = Status(PresenceState.PLAYING, "muted, hidden screen")
             return
         }
         work?.cancel()
@@ -126,15 +126,9 @@ object SpotifyPresence {
         }
         status.value = Status(PresenceState.SEARCHING, "${track.title} — ${track.artist}")
         val lookup = RootSpotify.findTrack(track.title, track.artist, track.durationSec)
-        if (lookup.error != null) {
-            status.value = Status(
-                if (lookup.error.contains("sign-in")) PresenceState.SIGN_IN_NEEDED else PresenceState.ERROR,
-                lookup.error,
-            )
-            return
-        }
-        val id = lookup.id
-        if (id == null) {
+        // The search API failing is not the end: the Spotify app can search for it itself.
+        val fallback = lookup.limited || (lookup.error != null)
+        if (lookup.id == null && !fallback) {
             // Whatever Spotify was last playing must not stay up as if it were this.
             if (spotifyUp) withContext(Dispatchers.IO) { RootSpotify.stop() }
             spotifyUp = false
@@ -143,7 +137,22 @@ object SpotifyPresence {
             return
         }
         status.value = Status(PresenceState.STARTING, "opening it in the Spotify app")
-        val problem = withContext(Dispatchers.IO) { RootSpotify.play(id) }
+        val screen = app?.let { withContext(Dispatchers.IO) { VirtualScreen.open(it) } }
+        val problem = withContext(Dispatchers.IO) {
+            val id = lookup.id
+            fun open(display: Int?) = if (id != null) {
+                RootSpotify.play(id, display)
+            } else {
+                RootSpotify.playFromSearch(track.title, track.artist, display)
+            }
+            var result = open(screen)
+            if (result != null && screen != null) {
+                // The system would not put Spotify on the hidden screen: a moment on the real one instead.
+                RootSpotify.log("hidden screen refused (${result.take(80)}); trying the real screen")
+                result = open(null)
+            }
+            result
+        }
         if (problem != null) {
             spotifyUp = false
             startedFor = null
@@ -152,7 +161,25 @@ object SpotifyPresence {
         }
         spotifyUp = true
         startedFor = track.id
-        status.value = Status(PresenceState.PLAYING, "muted, in the Spotify app")
+        status.value = Status(PresenceState.PLAYING, "muted, hidden screen")
+    }
+
+    /**
+     * The player is going away (or the app was swiped off): Spotify, its hidden
+     * screen and its audio settings go too. The root command runs on a thread of
+     * its own, which outlives this call and the process.
+     */
+    fun endSession() {
+        idleStop?.cancel()
+        debounce?.cancel()
+        work?.cancel()
+        val wasUp = spotifyUp
+        spotifyUp = false
+        startedFor = null
+        rootChecked = false
+        status.value = Status()
+        VirtualScreen.close()
+        if (wasUp) Thread { RootSpotify.stop() }.start()
     }
 
     /** Ends the session: Spotify is stopped and its audio settings are put back. */
@@ -165,6 +192,7 @@ object SpotifyPresence {
         startedFor = null
         rootChecked = false
         status.value = Status()
+        VirtualScreen.close()
         if (wasUp) scope.launch(Dispatchers.IO) { RootSpotify.stop() }
     }
 }

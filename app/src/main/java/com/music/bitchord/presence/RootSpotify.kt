@@ -81,17 +81,41 @@ internal object RootSpotify {
         return null
     }
 
+    /** Single-quotes [text] for the shell, whatever it contains. */
+    private fun quoted(text: String): String = "'" + text.replace("'", "'\\''") + "'"
+
+    /** Opens that one track and plays it. */
+    fun play(trackId: String, displayId: Int?): String? =
+        launch("-a android.intent.action.VIEW -d spotify:track:$trackId:play", displayId, "track $trackId")
+
     /**
-     * Starts [trackId] in the Spotify app, muted, then returns to whatever was on screen.
+     * For when the track's id cannot be looked up: asks the Spotify app to
+     * search for it and play the best match, the way a voice assistant would.
+     */
+    fun playFromSearch(title: String, artist: String, displayId: Int?): String? {
+        val args = "-a android.media.action.MEDIA_PLAY_FROM_SEARCH " +
+            "--es query ${quoted("$title $artist".trim())} " +
+            "--es android.intent.extra.focus vnd.android.cursor.item/audio " +
+            "--es android.intent.extra.title ${quoted(title)} " +
+            "--es android.intent.extra.artist ${quoted(artist)}"
+        return launch(args, displayId, "search")
+    }
+
+    /**
+     * Muted, started on the hidden screen when there is one. If Spotify
+     * nevertheless comes up on the real screen, it is sent straight back.
      * Returns null on success, or what went wrong.
      */
-    fun play(trackId: String): String? = synchronized(shellLock) {
+    private fun launch(intentArgs: String, displayId: Int?, what: String): String? = synchronized(shellLock) {
+        val display = if (displayId != null) "--display $displayId " else ""
+        val tries = if (displayId != null) 8 else 30
         val script = """
             cmd appops set $PACKAGE PLAY_AUDIO deny
             cmd appops set $PACKAGE TAKE_AUDIO_FOCUS deny
-            am start -a android.intent.action.VIEW -d spotify:track:$trackId:play -p $PACKAGE --activity-no-animation
-            for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+            am start $display$intentArgs -p $PACKAGE --activity-no-animation
+            for n in ${(1..tries).joinToString(" ")}; do
               if dumpsys activity activities | grep -m1 -E 'topResumedActivity|mResumedActivity' | grep -q $PACKAGE; then
+                echo "spotify came up on the real screen"
                 sleep 1
                 input keyevent 4
                 break
@@ -101,9 +125,12 @@ internal object RootSpotify {
             cmd appops get $PACKAGE PLAY_AUDIO
         """.trimIndent()
         val result = su(script, timeoutSec = 40)
-        log("play $trackId: code ${result.code}")
-        result.out.lines().filter { it.isNotBlank() }.takeLast(8).forEach { log("  $it") }
+        log("play ($what, display ${displayId ?: "real"}): code ${result.code}")
+        result.out.lines().filter { it.isNotBlank() }.takeLast(10).forEach { log("  $it") }
         if (result.code < 0) return result.out
+        if (result.out.contains("Error", ignoreCase = true) && result.out.contains("not started", ignoreCase = true)) {
+            return "the Spotify app did not accept the request"
+        }
         if (!result.out.contains("deny", ignoreCase = true)) {
             log("  warning: PLAY_AUDIO does not read as denied; the track may be audible")
         }
@@ -134,9 +161,14 @@ internal object RootSpotify {
 
     // ── Finding the track on Spotify ────────────────────────────────────────
 
-    class Lookup(val id: String?, val error: String? = null)
+    class Lookup(val id: String?, val error: String? = null, val limited: Boolean = false)
+
+    /** Until when the search API is left alone, after it said it was being asked too much. */
+    @Volatile
+    var apiBlockedUntil = 0L
 
     suspend fun findTrack(title: String, artist: String, durationSec: Int?): Lookup {
+        if (System.currentTimeMillis() < apiBlockedUntil) return Lookup(null, "search API is resting", limited = true)
         var token = withContext(Dispatchers.IO) { SpotifyToken.accessToken() }
         if (token.isNullOrBlank()) return Lookup(null, "Spotify sign-in is needed")
         val query = URLEncoder.encode("$title $artist".trim(), "UTF-8")
@@ -150,10 +182,16 @@ internal object RootSpotify {
                     connection.readTimeout = 10_000
                     connection.setRequestProperty("Authorization", "Bearer $token")
                     val code = connection.responseCode
+                    if (code == 429) {
+                        val wait = connection.getHeaderField("Retry-After")?.trim()?.toLongOrNull() ?: 600L
+                        // Whatever it asks for, the fallback below does not need it; check back in a while.
+                        apiBlockedUntil = System.currentTimeMillis() + wait.coerceIn(60L, 1_800L) * 1_000L
+                        log("search: HTTP 429, Retry-After ${wait}s; using the Spotify app's own search meanwhile")
+                    }
                     val stream = if (code in 200..299) connection.inputStream else connection.errorStream
                     code to stream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 }
-            }.getOrElse { return Lookup(null, "Spotify search failed: ${it.message}") }
+            }.getOrElse { return Lookup(null, "Spotify search failed: ${it.message}", limited = true) }
             val (code, body) = reply
             if (code == 401 && attempt++ == 0) {
                 SpotifyToken.invalidate()
@@ -163,7 +201,7 @@ internal object RootSpotify {
             }
             if (code !in 200..299) {
                 log("search: HTTP $code ${body.take(160)}")
-                return Lookup(null, "Spotify search failed (HTTP $code)")
+                return Lookup(null, "Spotify search failed (HTTP $code)", limited = true)
             }
             val items = runCatching { JSONObject(body).optJSONObject("tracks")?.optJSONArray("items") }.getOrNull()
                 ?: JSONArray()

@@ -58,10 +58,6 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
     @kotlin.OptIn(ExperimentalComposeUiApi::class)
     override fun onCreate() {
         super.onCreate()
-        // The Spotify activity process hosts one web page and nothing else. All
-        // of what follows — the audio cache, sources, the session — is the
-        // main process's, and a second copy of it would fight over the same files.
-        if (com.music.bitchord.presence.PresenceProtocol.isPresenceProcess(this)) return
         // The player is drawn by the shared UI module; this is what it reads
         // underneath — settings, the Canvas decoder, outputs, the party.
         AndroidStreamHooks.installEarly()

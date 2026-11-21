@@ -128,19 +128,12 @@
         -->
         <!--
           Spotify activity: a plain-text view of what the feature is doing
-          (see RootSpotify). It needs root; the Spotify app does the playing.
+          (see SpotifyPresence), with the web player that does the playing.
         -->
         <activity
             android:name=".presence.SpotifyPresenceActivity"
             android:exported="false"
             android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
-
-        <activity
-            android:name=".presence.SpotifyWebProbeActivity"
-            android:exported="false"
-            android:excludeFromRecents="true"
-            android:configChanges="orientation|screenSize|keyboardHidden"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
 
         <activity

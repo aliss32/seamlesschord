@@ -503,9 +503,9 @@
     <string name="next_track_quality">Sonraki parça kalitesi</string>
     <string name="spotify_presence">Spotify etkinliği</string>
     <string name="spotify_presence_toggle">Ne dinlediğimi Spotify\'da göster</string>
-    <string name="spotify_presence_footer">Her parçayı arka planda, Spotify\'ın kendi web oynatıcısında sessizce çalar; böylece Spotify bunu etkinliğin olarak gösterir. Yalnızca Spotify\'da bulunan parçalar gösterilebilir. Bir miktar pil ve veri kullanır; varsayılan olarak kapalıdır. Bu, Spotify\'ın web oynatıcısını otomatikleştirir ve Spotify\'ın şartları buna izin vermeyebilir; sorumluluk sende.</string>
-    <string name="spotify_presence_view">Spotify web oynatıcısını göster</string>
-    <string name="spotify_presence_view_subtitle">Yeniden giriş yap, ne yaptığına bak veya bu ziyaret için sesi aç</string>
+    <string name="spotify_presence_footer">Root gerekir. Spotify uygulaması her parçayı arka planda, sistem tarafından sessize alınmış ve ekrana çıkmadan çalar; böylece Spotify bunu etkinliğin olarak gösterir. Yalnızca Spotify\'da bulunan parçalar gösterilebilir. Bir miktar pil ve veri kullanır; varsayılan olarak kapalıdır. Bu, Spotify uygulamasını otomatikleştirir ve Spotify\'ın şartları buna izin vermeyebilir; sorumluluk sende.</string>
+    <string name="spotify_presence_view">Spotify etkinliği günlüğü</string>
+    <string name="spotify_presence_view_subtitle">Ne yaptığına bak, günlüğü kopyala veya Spotify\'ın sesini geri ver</string>
     <string name="presence_state_off">Kapalı</string>
     <string name="presence_state_starting">Başlatılıyor</string>
     <string name="presence_state_sign_in">Giriş gerekli</string>

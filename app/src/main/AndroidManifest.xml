@@ -127,22 +127,13 @@
           still recreate the Activity so the theme is rebuilt from resources.
         -->
         <!--
-          Spotify activity: Spotify's web player, run silently in a process of
-          its own so that a page that crashes or is reclaimed never takes the
-          player with it. Bound only while the setting is on and music is
-          playing. BitChordApplication keeps this process from starting the
-          rest of the app.
+          Spotify activity: a plain-text view of what the feature is doing
+          (see RootSpotify). It needs root; the Spotify app does the playing.
         -->
-        <service
-            android:name=".presence.SpotifyPresenceService"
-            android:process=":spotify"
-            android:exported="false" />
         <activity
             android:name=".presence.SpotifyPresenceActivity"
-            android:process=":spotify"
             android:exported="false"
             android:excludeFromRecents="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
 
         <activity

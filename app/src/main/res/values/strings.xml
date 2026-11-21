@@ -725,9 +725,9 @@
     <string name="next_track_quality">Next track quality</string>
     <string name="spotify_presence">Spotify activity</string>
     <string name="spotify_presence_toggle">Show what I\'m playing on Spotify</string>
-    <string name="spotify_presence_footer">Plays each track silently in Spotify\'s own web player in the background, so Spotify shows it as your activity. Only tracks Spotify has can be shown. Uses some battery and data; off by default. This automates Spotify\'s web player, which Spotify\'s terms may not allow — use it at your own risk.</string>
-    <string name="spotify_presence_view">Show Spotify web player</string>
-    <string name="spotify_presence_view_subtitle">Sign in again, check what it is doing, or unmute it for this visit</string>
+    <string name="spotify_presence_footer">Needs root. The Spotify app plays each track in the background, muted by the system and kept off the screen, so Spotify shows it as your activity. Only tracks Spotify has can be shown. Uses some battery and data; off by default. This automates the Spotify app, which Spotify\'s terms may not allow — use it at your own risk.</string>
+    <string name="spotify_presence_view">Spotify activity log</string>
+    <string name="spotify_presence_view_subtitle">See what it is doing, copy the log, or put Spotify\'s sound back</string>
     <string name="presence_state_off">Off</string>
     <string name="presence_state_starting">Starting</string>
     <string name="presence_state_sign_in">Sign-in needed</string>

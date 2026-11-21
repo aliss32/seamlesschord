@@ -125,13 +125,12 @@ object SpotifyPresence {
     /** The self-test button: what this phone allows, written into the log. */
     fun selfTest() {
         scope.launch(Dispatchers.IO) {
-            val hidden = if (spotifyUp) {
-                "in use by the session"
-            } else {
-                val ctx = app
-                if (ctx == null) {
-                    "no context"
-                } else {
+            val ctx = app
+            val hidden = when {
+                ctx == null -> "no context"
+                // A session is using it: closing it here would pull the screen out from under Spotify.
+                spotifyUp || VirtualScreen.isOpen() -> "in use by the session (left alone)"
+                else -> {
                     val id = VirtualScreen.open(ctx)
                     VirtualScreen.close()
                     if (id != null) "works (id $id)" else "REFUSED by the system"
@@ -154,7 +153,11 @@ object SpotifyPresence {
         val id = mediaId ?: return
         val name = title?.takeIf { it.isNotBlank() } ?: return
         val track = Track(id, name, artist.orEmpty(), (durationMs / 1000).toInt().takeIf { it > 0 })
-        if (track == latest && playing == latestPlaying) return
+        // Only the track's identity decides whether this is a change: its length is often reported late or revised.
+        if (id == latest?.id && playing == latestPlaying) {
+            latest = track
+            return
+        }
         latest = track
         latestPlaying = playing
         debounce?.cancel()

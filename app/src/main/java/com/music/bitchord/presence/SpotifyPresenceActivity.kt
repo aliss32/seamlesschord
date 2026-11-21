@@ -92,6 +92,11 @@ class SpotifyPresenceActivity : Activity() {
             }
             flashLabel()
             addView(flash)
+            addView(
+                button("WebView test") {
+                    startActivity(android.content.Intent(this@SpotifyPresenceActivity, SpotifyWebProbeActivity::class.java))
+                },
+            )
         }
         val scroll = ScrollView(this).apply { addView(log) }
         root.addView(status)

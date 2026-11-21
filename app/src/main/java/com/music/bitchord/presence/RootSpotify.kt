@@ -34,7 +34,7 @@ internal object RootSpotify {
 
     private const val LOG_LINES = 400
     private const val DURATION_TOLERANCE_SEC = 8
-    private const val MAX_WAIT_MS = 8_000L
+    private const val MAX_WAIT_MS = 60_000L
     private const val MAX_RATE_LIMIT_TRIES = 3
 
     private val lines = ArrayDeque<String>()
@@ -191,7 +191,9 @@ internal object RootSpotify {
     // ── Reading what Spotify is doing ───────────────────────────────────────
 
     /** Spotify's media session: its state (3 = playing) and the "title, artist, album" line it publishes. */
-    class Snap(val state: Int?, val desc: String, val block: String)
+    class Snap(val state: Int?, val desc: String, val block: String) {
+        val stateLine: String get() = block.lines().firstOrNull { it.contains("PlaybackState") }.orEmpty().trim().take(170)
+    }
 
     fun snapshot(): Snap {
         val lines = su("dumpsys media_session", 15).out.lines()
@@ -202,8 +204,10 @@ internal object RootSpotify {
             if (lines[i].contains("package=")) { end = i; break }
         }
         val block = lines.subList(start, end).joinToString("\n")
-        val state = Regex("""PlaybackState\s*\{\s*state=(\d+)""").find(block)?.groupValues?.get(1)?.toIntOrNull()
-            ?: Regex("""\bstate=(\d+)""").find(block)?.groupValues?.get(1)?.toIntOrNull()
+        val stateLine = block.lines().firstOrNull { it.contains("PlaybackState") }.orEmpty()
+        val numeric = Regex("""state=(?:[A-Za-z_]+\()?(\d+)""")
+        val state = numeric.find(stateLine.substringAfter("PlaybackState"))?.groupValues?.get(1)?.toIntOrNull()
+            ?: numeric.find(block)?.groupValues?.get(1)?.toIntOrNull()
         val desc = Regex("""description=([^\n]*)""").find(block)?.groupValues?.get(1).orEmpty().trim()
         return Snap(state, desc, block)
     }
@@ -270,6 +274,7 @@ internal object RootSpotify {
     private fun diagnose() {
         val snap = snapshot()
         log("  media session: state ${snap.state ?: "none"}, \"${snap.desc.take(80)}\"; resumed on display ${spotifyDisplays().ifEmpty { setOf("none") }.joinToString()}")
+        log("  raw: ${snap.stateLine}")
         val uid = uidOfSpotify()
         if (uid != null) {
             log("  uid $uid state: " + su("cmd activity get-uid-state $uid || am get-uid-state $uid", 8).out.lines().lastOrNull().orEmpty().take(100))
@@ -335,9 +340,10 @@ internal object RootSpotify {
             find(nodes)?.let { return it }
             if (poll == 3 || poll == UI_POLLS) {
                 val mine = nodes.count { it.pkg == PACKAGE }
-                log("  ui: ${nodes.size} nodes, $mine from Spotify; nothing to touch yet")
-                nodes.filter { it.pkg == PACKAGE && it.label.isNotBlank() }.map { it.label.take(36) }.distinct().take(14)
-                    .forEach { log("    · $it") }
+                log("  ui: ${nodes.size} nodes, $mine from Spotify; packages: " +
+                    nodes.groupBy { it.pkg }.entries.joinToString { "${it.key}=${it.value.size}" }.take(200))
+                nodes.filter { it.label.isNotBlank() }.map { "${it.pkg.substringAfterLast('.')}: ${it.label.take(30)}" }
+                    .distinct().take(14).forEach { log("    · $it") }
             }
         }
         return null
@@ -377,7 +383,7 @@ internal object RootSpotify {
             )
         }
         log("${rung.label} (display ${displayId ?: "real"}): code ${started.code}")
-        started.out.lines().filter { it.isNotBlank() }.takeLast(3).forEach { log("  $it") }
+        started.out.lines().filter { it.isNotBlank() }.let { if (started.code != 0) it.take(6) else it.takeLast(3) }.forEach { log("  ${it.take(200)}") }
         if (started.code < 0) return Outcome(Verdict.SILENT, started.out)
         if (stale(ticket)) return Outcome(Verdict.CANCELLED)
         when (rung) {
@@ -406,9 +412,11 @@ internal object RootSpotify {
      */
     fun startPlayback(id: String?, title: String, artist: String, displayId: Int?, ticket: Int): String? {
         val order = mutableListOf<Rung>()
-        if (id != null) { order += Rung.ID; order += Rung.PAGE }
-        order += Rung.SEARCH
+        // The ways that need no reading of Spotify's screen come first; touching a screen is the last resort.
+        if (id != null) order += Rung.ID
         order += Rung.VOICE
+        if (id != null) order += Rung.PAGE
+        order += Rung.SEARCH
         val good = Rung.values().firstOrNull { it.label == lastGoodRung }
         if (good != null && good in order) { order.remove(good); order.add(0, good) }
         var problem = "none of the ways of starting it worked"

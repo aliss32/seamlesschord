@@ -65,6 +65,10 @@ internal object VirtualScreen {
         }
     }
 
+    /** Whether a screen exists right now (a session may be using it). */
+    @Synchronized
+    fun isOpen(): Boolean = display != null
+
     @Synchronized
     fun close() {
         runCatching { display?.release() }

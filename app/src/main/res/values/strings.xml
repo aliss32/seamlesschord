@@ -737,7 +737,7 @@
     <string name="presence_state_not_found">Not on Spotify</string>
     <string name="presence_state_error">Error</string>
     <string name="next_track_best_lead">Prepare next track in best quality</string>
-    <string name="next_track_best_lead_subtitle">How many seconds before a track ends to start looking for the next one's best copy</string>
+    <string name="next_track_best_lead_subtitle">How many seconds before a track ends to start looking for the next one\'s best copy</string>
     <string name="next_track_best_lead_footer">The next track then starts on its best copy instead of upgrading while it plays. 20 s or more is recommended. Off means it starts on a quick source and upgrades without a cut. Skipped on battery saver.</string>
     <string name="spdc_token">sp_dc token</string>
     <string name="spotify_canvas_setup">Set up Spotify</string>

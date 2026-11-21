@@ -3,6 +3,10 @@
 <br/>
 <br/>
 
+# Everything + seamless source upgrade 
+
+### A patch to improve the application's quality upgrade algorithm
+
 <img src="Logo.png" alt="BitChord app icon" width="200" />
 
 # BitChord
